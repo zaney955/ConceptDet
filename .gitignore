@@ -1,0 +1,71 @@
+# Byte-compiled files and interpreter caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Python packaging and build output
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Test, lint, type-check, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Notebook and tooling caches
+.ipynb_checkpoints/
+.cache/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and local runtime state
+*.log
+*.pid
+*.seed
+
+# Local datasets, generated predictions, and experiment tracking
+inputs/
+outputs/
+wandb/
+mlruns/
+runs/
+
+# Model checkpoints and large tensor artifacts
+checkpoints/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Accidental files produced by unquoted shell comparison operators/output
+/=24.00
+/SKIP
+/USE

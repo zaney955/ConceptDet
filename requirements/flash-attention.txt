@@ -1,0 +1,2 @@
+# Install only after requirements/runtime.txt, with --no-build-isolation.
+flash-attn==2.8.3.post1
