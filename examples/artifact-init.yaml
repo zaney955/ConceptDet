@@ -1,0 +1,5 @@
+schema_version: 1
+kind: artifact.init
+source_adapter: ../checkpoints/sft-final
+output_dir: ../artifacts/sft-final
+stage: sft

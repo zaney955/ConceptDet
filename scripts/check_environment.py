@@ -7,12 +7,13 @@ import os
 import sys
 from pathlib import Path
 
-
 EXPECTED_VERSIONS = {
     "accelerate": "1.14.0",
     "flash-attn": "2.8.3.post1",
     "numpy": "2.5.1",
+    "peft": "0.19.1",
     "pillow": "12.3.0",
+    "pyyaml": "6.0.3",
     "safetensors": "0.8.0",
     "sentencepiece": "0.2.2",
     "torch": "2.13.0",
@@ -58,7 +59,8 @@ def main() -> int:
     import flash_attn  # noqa: F401
     import torch
     import torchvision  # noqa: F401
-    from transformers import Qwen2_5_VLForConditionalGeneration  # noqa: F401
+    from peft import PeftModel  # noqa: F401
+    from transformers import Qwen3VLForConditionalGeneration  # noqa: F401
 
     print(f"python={sys.version.split()[0]}")
     print(f"environment={active_prefix}")

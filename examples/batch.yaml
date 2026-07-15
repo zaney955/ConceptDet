@@ -1,0 +1,13 @@
+schema_version: 1
+kind: infer.batch
+artifact: ../artifacts/sft-final
+manifest: tasks.jsonl
+output_dir: ../outputs/batch
+layout: annotated
+overwrite: false
+runtime:
+  device: cuda:0
+  dtype: bfloat16
+  attention: flash_attention_2
+  max_new_tokens: 192
+  local_files_only: false

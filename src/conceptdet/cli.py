@@ -7,234 +7,280 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from conceptdet.errors import ConceptDetError, InputError
-from conceptdet.model import TransformersBackend
-from conceptdet.pipeline import DetectionPipeline, DetectionRequest
-from conceptdet.types import Box, parse_boxes
+import yaml
+
+from conceptdet.application import DetectionApplication, run_detect_config
+from conceptdet.artifact import (
+    AdapterArtifact,
+    initialize_artifact,
+    validate_source_adapter,
+)
+from conceptdet.config import (
+    ArtifactInitConfig,
+    BatchConfig,
+    DetectConfig,
+    OutputConfig,
+    RequestConfig,
+    config_to_dict,
+    load_config,
+)
+from conceptdet.errors import (
+    ArtifactError,
+    ConceptDetError,
+    ConfigurationError,
+    InputError,
+)
+from conceptdet.model import Qwen3VLAdapter
+from conceptdet.protocol import serialize_detection_set
+from conceptdet.types import Box
 
 
-def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model", required=True, help="ConceptSeg-R1 checkpoint directory")
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
-    parser.add_argument(
-        "--dtype",
-        choices=("auto", "float32", "float16", "bfloat16"),
-        default="auto",
-    )
-    parser.add_argument(
-        "--attention",
-        choices=("auto", "eager", "sdpa", "flash_attention_2"),
-        default="flash_attention_2",
-    )
-    parser.add_argument("--input-size", type=int, default=600)
-    parser.add_argument("--max-new-tokens", type=int, default=768)
-    parser.add_argument("--box-color", default="red")
-    parser.add_argument("--box-width", type=int, default=2)
-    parser.add_argument(
-        "--reference-box-width",
-        type=int,
-        default=2,
-        help="Reference prompt bbox width; keep at 2 for ConceptSeg compatibility",
-    )
-    parser.add_argument(
-        "--output-layout",
-        choices=("triptych", "annotated"),
-        default="triptych",
-        help="Save Reference|Target|Detection or only the original-size detection",
-    )
-
-
-def _add_reference_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--reference", required=True, help="Reference image")
-    parser.add_argument(
-        "--reference-box",
-        required=True,
-        action="append",
-        help="Original-image XYXY box. Repeat the option or separate boxes with ';'.",
-    )
-    parser.add_argument(
-        "--reference-crop",
-        choices=("full", "crop"),
-        default="full",
-        help="Use the full reference image or a bbox-centered crop",
-    )
-    parser.add_argument("--reference-context-scale", type=float, default=4.0)
+def _config_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", required=True, type=Path)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="conceptdet",
-        description="Reference-guided bbox detection without SAM3 segmentation",
+        prog="conceptdet", description="Qwen3-VL reference-guided Detection Sets"
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.0")
+    domains = parser.add_subparsers(dest="domain", required=True)
 
-    detect = subparsers.add_parser("detect", help="Run one detection request")
-    _add_model_arguments(detect)
-    _add_reference_arguments(detect)
-    detect.add_argument("--target", required=True, help="Target image")
-    detect.add_argument("--query", required=True, help="Concept description")
-    detect.add_argument("--output", required=True, help="Annotated target image")
-    detect.add_argument("--json-output", help="Structured result; defaults beside --output")
-    detect.add_argument("--print-raw", action="store_true", help="Print raw model completion")
+    infer = domains.add_parser("infer", help="Run reference-guided inference")
+    infer_commands = infer.add_subparsers(dest="operation", required=True)
+    _config_argument(infer_commands.add_parser("detect", help="Run one request"))
+    _config_argument(infer_commands.add_parser("batch", help="Run a JSONL manifest"))
 
-    batch = subparsers.add_parser("batch", help="Run tasks from a JSONL manifest")
-    _add_model_arguments(batch)
-    batch.add_argument("--manifest", required=True, help="One JSON object per line")
-    batch.add_argument("--output-dir", required=True)
-    batch.add_argument("--overwrite", action="store_true")
+    config = domains.add_parser("config", help="Validate and render typed YAML")
+    config_commands = config.add_subparsers(dest="operation", required=True)
+    _config_argument(config_commands.add_parser("validate"))
+    render = config_commands.add_parser("render")
+    _config_argument(render)
+    render.add_argument("--output", type=Path)
+
+    artifact = domains.add_parser("artifact", help="Manage immutable Adapter Artifacts")
+    artifact_commands = artifact.add_subparsers(dest="operation", required=True)
+    _config_argument(artifact_commands.add_parser("init"))
+    inspect = artifact_commands.add_parser("inspect")
+    inspect.add_argument("artifact", type=Path)
+    inspect.add_argument("--json", action="store_true")
     return parser
 
 
-def _pipeline(args: argparse.Namespace) -> DetectionPipeline:
-    backend = TransformersBackend.load(
-        args.model,
-        device=args.device,
-        dtype=args.dtype,
-        attention=args.attention,
-    )
-    return DetectionPipeline(
-        backend,
-        input_size=args.input_size,
-        max_new_tokens=args.max_new_tokens,
-        annotation_color=args.box_color,
-        annotation_width=args.box_width,
-        reference_box_width=args.reference_box_width,
-        output_layout=args.output_layout,
-    )
+def _load_adapter(config: DetectConfig | BatchConfig) -> Qwen3VLAdapter:
+    return Qwen3VLAdapter.load(config.artifact, config.runtime)
 
 
-def _boxes_from_cli(values: list[str]) -> tuple[Box, ...]:
-    boxes: list[Box] = []
-    for value in values:
-        boxes.extend(parse_boxes(value))
-    return tuple(boxes)
-
-
-def _run_detect(args: argparse.Namespace) -> int:
-    pipeline = _pipeline(args)
-    request = DetectionRequest(
-        reference_path=Path(args.reference),
-        reference_boxes=_boxes_from_cli(args.reference_box),
-        target_path=Path(args.target),
-        query=args.query,
-        reference_crop_mode=args.reference_crop,
-        reference_crop_context_scale=args.reference_context_scale,
-    )
-    output_path = Path(args.output)
-    json_path = Path(args.json_output) if args.json_output else None
-    result = pipeline.run(request, output_path=output_path, json_path=json_path)
-    print(json.dumps(result.to_dict()["detections"], ensure_ascii=False))
-    print(f"Output image: {output_path.expanduser().resolve()}")
-    print(f"JSON result: {(json_path or output_path.with_suffix('.json')).expanduser().resolve()}")
-    if args.print_raw:
-        print(result.raw_completion)
-    return 0
-
-
-def _read_manifest(path: Path) -> list[tuple[int, dict[str, Any]]]:
-    if not path.is_file():
-        raise InputError(f"Manifest does not exist: {path}")
-    records: list[tuple[int, dict[str, Any]]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise InputError(f"Invalid JSON at {path}:{line_number}: {exc}") from exc
-        if not isinstance(record, dict):
-            raise InputError(f"Manifest record at {path}:{line_number} must be an object")
-        records.append((line_number, record))
-    if not records:
-        raise InputError(f"Manifest contains no tasks: {path}")
-    return records
-
-
-def _resolve_manifest_path(value: str, base_dir: Path) -> Path:
-    path = Path(value).expanduser()
-    return path if path.is_absolute() else base_dir / path
+def _validate_resources(config: DetectConfig | BatchConfig | ArtifactInitConfig) -> None:
+    if isinstance(config, DetectConfig):
+        AdapterArtifact.load(config.artifact)
+        for description, path in (
+            ("reference image", config.request.reference_image),
+            ("target image", config.request.target_image),
+        ):
+            if not path.is_file():
+                raise InputError(f"{description.capitalize()} does not exist: {path}")
+    elif isinstance(config, BatchConfig):
+        AdapterArtifact.load(config.artifact)
+        for _, row in _manifest_rows(config.manifest):
+            request = _request_from_row(row, config.manifest.parent)
+            for description, path in (
+                ("reference image", request.reference_image),
+                ("target image", request.target_image),
+            ):
+                if not path.is_file():
+                    raise InputError(f"{description.capitalize()} does not exist: {path}")
+    else:
+        validate_source_adapter(config.source_adapter)
+        if config.output_dir.exists():
+            raise ArtifactError(f"Artifact output already exists: {config.output_dir}")
+        if config.parent_artifact is not None:
+            AdapterArtifact.load(config.parent_artifact)
 
 
 def _safe_name(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
-    return cleaned or "task"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "task"
 
 
-def _manifest_request(record: dict[str, Any], base_dir: Path) -> DetectionRequest:
-    required = {"reference", "reference_boxes", "target", "query"}
-    missing = sorted(required - record.keys())
-    if missing:
-        raise InputError(f"Manifest task is missing fields: {', '.join(missing)}")
-    return DetectionRequest(
-        reference_path=_resolve_manifest_path(str(record["reference"]), base_dir),
-        reference_boxes=parse_boxes(record["reference_boxes"]),
-        target_path=_resolve_manifest_path(str(record["target"]), base_dir),
-        query=str(record["query"]),
-        reference_crop_mode=str(record.get("reference_crop", "full")),
-        reference_crop_context_scale=float(record.get("reference_context_scale", 4.0)),
-    )
-
-
-def _run_batch(args: argparse.Namespace) -> int:
-    manifest_path = Path(args.manifest).expanduser().resolve()
-    records = _read_manifest(manifest_path)
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pipeline = _pipeline(args)
-    summary_path = output_dir / "results.jsonl"
-    failures = 0
-    summaries: list[dict[str, object]] = []
-
-    for index, (line_number, record) in enumerate(records):
-        task_id = str(record.get("id", f"task-{index:06d}"))
-        filename = str(record.get("output", f"{_safe_name(task_id)}.png"))
-        output_path = Path(filename)
-        if not output_path.is_absolute():
-            output_path = output_dir / output_path
-        json_path = output_path.with_suffix(".json")
-        if output_path.exists() and not args.overwrite:
-            item = {"id": task_id, "status": "skipped", "output": str(output_path)}
-            summaries.append(item)
-            print(f"SKIP {task_id}: {output_path}")
+def _manifest_rows(path: Path) -> list[tuple[int, dict[str, Any]]]:
+    if not path.is_file():
+        raise InputError(f"Manifest does not exist: {path}")
+    rows: list[tuple[int, dict[str, Any]]] = []
+    output_names: dict[str, int] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
         try:
-            request = _manifest_request(record, manifest_path.parent)
-            result = pipeline.run(request, output_path=output_path, json_path=json_path)
-            item = {
-                "id": task_id,
-                "status": "ok",
-                "output": str(output_path),
-                "result": str(json_path),
-                "detections": result.to_dict()["detections"],
-            }
-            print(f"OK   {task_id}: {output_path}")
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise InputError(f"Invalid JSON at {path}:{line_number}: {exc.msg}") from exc
+        if not isinstance(row, dict):
+            raise InputError(f"Manifest row {line_number} must be an object")
+        allowed = {"id", "reference_image", "reference_boxes", "target_image", "query"}
+        missing = allowed - {"id"} - set(row)
+        unknown = set(row) - allowed
+        if missing or unknown:
+            raise InputError(
+                f"Manifest row {line_number} missing={sorted(missing)} unknown={sorted(unknown)}"
+            )
+        task_id = row.get("id", f"task-{len(rows):06d}")
+        if (
+            isinstance(task_id, bool)
+            or not isinstance(task_id, (str, int))
+            or not str(task_id).strip()
+        ):
+            raise InputError(f"Manifest row {line_number} id must be a nonempty string or integer")
+        output_name = _safe_name(str(task_id))
+        if output_name in output_names:
+            raise InputError(
+                f"Manifest rows {output_names[output_name]} and {line_number} "
+                f"map to the same output name: {output_name}"
+            )
+        output_names[output_name] = line_number
+        rows.append((line_number, row))
+    if not rows:
+        raise InputError(f"Manifest has no records: {path}")
+    return rows
+
+
+def _manifest_path(value: object, base: Path, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise InputError(f"Manifest {field} must be a path string")
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else base / path).resolve()
+
+
+def _request_from_row(row: dict[str, Any], base: Path) -> RequestConfig:
+    raw_boxes = row["reference_boxes"]
+    if not isinstance(raw_boxes, list) or not raw_boxes:
+        raise InputError("reference_boxes must be a nonempty list")
+    query = row["query"]
+    if not isinstance(query, str) or not query.strip():
+        raise InputError("query must be a nonempty string")
+    return RequestConfig(
+        _manifest_path(row["reference_image"], base, "reference_image"),
+        tuple(Box.from_sequence(box) for box in raw_boxes),
+        _manifest_path(row["target_image"], base, "target_image"),
+        query.strip(),
+    )
+
+
+def _run_batch(config: BatchConfig, adapter: Any) -> int:
+    application = DetectionApplication(adapter)
+    rows = _manifest_rows(config.manifest)
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    summaries = []
+    failures = 0
+    for index, (line_number, row) in enumerate(rows):
+        task_id = str(row.get("id", f"task-{index:06d}"))
+        image_output = config.output_dir / f"{_safe_name(task_id)}.png"
+        json_output = image_output.with_suffix(".json")
+        if image_output.exists() and not config.overwrite:
+            summaries.append({"id": task_id, "status": "skipped", "output": str(image_output)})
+            continue
+        try:
+            request = _request_from_row(row, config.manifest.parent)
+            result = application.run(
+                request,
+                OutputConfig(image_output, json_output, config.layout),
+                max_new_tokens=config.runtime.max_new_tokens,
+                config_hash=config.config_hash,
+            )
+            summaries.append(
+                {
+                    "id": task_id,
+                    "status": "ok",
+                    "result": str(json_output),
+                    "detection_set": [
+                        item.to_model_dict() for item in result.protocol_detections
+                    ],
+                }
+            )
         except (ConceptDetError, OSError, ValueError) as exc:
             failures += 1
-            item = {
-                "id": task_id,
-                "status": "failed",
-                "manifest_line": line_number,
-                "error": str(exc),
-            }
-            print(f"FAIL {task_id}: {exc}", file=sys.stderr)
-        summaries.append(item)
-
+            summaries.append(
+                {"id": task_id, "status": "failed", "line": line_number, "error": str(exc)}
+            )
+    summary_path = config.output_dir / "results.jsonl"
     summary_path.write_text(
-        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in summaries),
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in summaries),
         encoding="utf-8",
     )
-    print(f"Batch summary: {summary_path}")
+    print(f"Batch summary: {summary_path}", file=sys.stderr)
     return 1 if failures else 0
 
 
+def _execute(args: argparse.Namespace) -> int:
+    if args.domain == "artifact" and args.operation == "inspect":
+        artifact = AdapterArtifact.load(args.artifact)
+        payload = {
+            "path": str(artifact.path),
+            "artifact_fingerprint": artifact.fingerprint,
+            "contract_fingerprint": artifact.contract["contract_fingerprint"],
+            "contract": artifact.contract,
+            "summary": artifact.summary,
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"Artifact: {artifact.path}")
+            print(f"Artifact fingerprint: {artifact.fingerprint}")
+            print(f"Contract fingerprint: {artifact.contract['contract_fingerprint']}")
+            print(f"Stage: {artifact.summary.get('stage')}")
+        return 0
+
+    config = load_config(args.config)
+    if args.domain == "config":
+        payload = config_to_dict(config)
+        if args.operation == "validate":
+            _validate_resources(config)
+            print(json.dumps({"kind": config.kind, "config_hash": config.config_hash}))
+            return 0
+        payload.pop("config_hash")
+        rendered = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered, encoding="utf-8")
+        else:
+            print(rendered, end="")
+        return 0
+
+    if args.domain == "artifact":
+        if not isinstance(config, ArtifactInitConfig):
+            raise ConfigurationError("artifact init requires kind: artifact.init")
+        artifact = initialize_artifact(config)
+        print(
+            json.dumps(
+                {"artifact": str(artifact.path), "artifact_fingerprint": artifact.fingerprint}
+            )
+        )
+        return 0
+
+    if args.operation == "detect":
+        if not isinstance(config, DetectConfig):
+            raise ConfigurationError("infer detect requires kind: infer.detect")
+        _validate_resources(config)
+        result = run_detect_config(config, _load_adapter(config))
+        print(serialize_detection_set(result.protocol_detections))
+        print(f"Output image: {config.output.image}", file=sys.stderr)
+        print(f"JSON result: {config.output.json}", file=sys.stderr)
+        return 0
+    if not isinstance(config, BatchConfig):
+        raise ConfigurationError("infer batch requires kind: infer.batch")
+    _validate_resources(config)
+    return _run_batch(config, _load_adapter(config))
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     try:
-        return _run_detect(args) if args.command == "detect" else _run_batch(args)
-    except (ConceptDetError, OSError, ValueError) as exc:
+        return _execute(args)
+    except (ConfigurationError, ArtifactError, InputError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    except (ConceptDetError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

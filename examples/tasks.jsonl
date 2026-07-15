@@ -1,1 +1,1 @@
-{"id":"example-001","reference":"reference.jpg","reference_boxes":[[100,120,220,280]],"target":"target.jpg","query":"the same component as the red-boxed example","output":"example-001.png"}
+{"id":"example-001","reference_image":"reference.jpg","reference_boxes":[[100,120,220,280]],"target_image":"target.jpg","query":"the same component as the boxed example"}

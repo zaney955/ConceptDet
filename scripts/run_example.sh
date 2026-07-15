@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/path/to/ConceptSeg-R1-7B}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-conceptdet detect \
-  --model "${MODEL_PATH}" \
-  --reference "reference.jpg" \
-  --reference-box "100,120,220,280" \
-  --target "target.jpg" \
-  --query "the same component as the red-boxed example" \
-  --output "outputs/result.png"
+exec "${REPO_ROOT}/scripts/run_inference.sh" infer detect \
+  --config "${1:-${REPO_ROOT}/examples/detect.yaml}"

@@ -37,4 +37,4 @@ fi
 
 echo
 echo "Environment ready. Run inference with:"
-echo "  ${REPO_ROOT}/scripts/run_inference.sh"
+echo "  ${REPO_ROOT}/scripts/run_inference.sh infer detect --config FILE"

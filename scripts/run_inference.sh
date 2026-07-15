@@ -10,4 +10,11 @@ if [[ ! -x "${PYTHON}" ]]; then
   exit 1
 fi
 
-exec "${PYTHON}" "${REPO_ROOT}/scripts/inference_config.py" "$@"
+if [[ $# -eq 0 ]]; then
+  echo "Usage: $0 infer detect --config FILE" >&2
+  echo "       $0 infer batch --config FILE" >&2
+  exit 2
+fi
+
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+exec "${PYTHON}" -m conceptdet "$@"

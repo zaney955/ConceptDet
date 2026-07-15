@@ -1,0 +1,19 @@
+schema_version: 1
+kind: infer.detect
+artifact: ../artifacts/sft-final
+request:
+  reference_image: reference.jpg
+  reference_boxes:
+    - [100, 120, 220, 280]
+  target_image: target.jpg
+  query: the same component as the boxed example
+output:
+  image: ../outputs/example.png
+  json: ../outputs/example.json
+  layout: annotated
+runtime:
+  device: cuda:0
+  dtype: bfloat16
+  attention: flash_attention_2
+  max_new_tokens: 192
+  local_files_only: false
