@@ -20,6 +20,7 @@ SUPPORTED_KINDS = frozenset(
         "data.voc",
         "train.sft",
         "train.grpo",
+        "predict.dataset",
         "evaluate",
     }
 )
@@ -212,6 +213,19 @@ class GRPOStageConfig:
 
 
 @dataclass(frozen=True)
+class DatasetPredictionConfig:
+    schema_version: int
+    kind: Literal["predict.dataset"]
+    dataset_dir: Path
+    artifact: Path
+    predictions: Path
+    split: Literal["train", "validation", "test"]
+    runtime: RuntimeConfig
+    config_path: Path
+    config_hash: str
+
+
+@dataclass(frozen=True)
 class EvaluationConfig:
     schema_version: int
     kind: Literal["evaluate"]
@@ -231,6 +245,7 @@ ConceptDetConfig: TypeAlias = (  # noqa: UP040 - package supports Python 3.10
     | DataVocConfig
     | SFTStageConfig
     | GRPOStageConfig
+    | DatasetPredictionConfig
     | EvaluationConfig
 )
 
@@ -753,6 +768,44 @@ def load_config(path: str | Path) -> ConceptDetConfig:
             )
         )
 
+    if kind == "predict.dataset":
+        _mapping(
+            root,
+            "$",
+            allowed={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "artifact",
+                "predictions",
+                "split",
+                "runtime",
+            },
+            required={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "artifact",
+                "predictions",
+            },
+        )
+        split = root.get("split", "test")
+        if split not in {"train", "validation", "test"}:
+            raise ConfigurationError("$.split must be train, validation, or test")
+        return _finalize_hash(
+            DatasetPredictionConfig(
+                1,
+                "predict.dataset",
+                _path(root["dataset_dir"], "$.dataset_dir", base),
+                _path(root["artifact"], "$.artifact", base),
+                _path(root["predictions"], "$.predictions", base),
+                split,
+                _runtime(root.get("runtime")),
+                config_path,
+                "",
+            )
+        )
+
     if kind == "evaluate":
         _mapping(
             root,
@@ -906,6 +959,17 @@ def config_to_dict(config: ConceptDetConfig) -> dict[str, Any]:
             "predictions": str(config.predictions),
             "split": config.split,
             "output_dir": str(config.output_dir),
+            "config_hash": config.config_hash,
+        }
+    if isinstance(config, DatasetPredictionConfig):
+        return {
+            "schema_version": 1,
+            "kind": config.kind,
+            "dataset_dir": str(config.dataset_dir),
+            "artifact": str(config.artifact),
+            "predictions": str(config.predictions),
+            "split": config.split,
+            "runtime": config.runtime.__dict__,
             "config_hash": config.config_hash,
         }
     return {

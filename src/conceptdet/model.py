@@ -20,14 +20,14 @@ MAX_VISUAL_TOKENS = 640
 MAX_TOTAL_SEQUENCE_TOKENS = 1536
 
 
-def _smart_size(image: Image.Image) -> tuple[int, int]:
+def smart_image_size(image_size: tuple[int, int]) -> tuple[int, int]:
     try:
         from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
     except ImportError as exc:
         raise ModelLoadError("Transformers Qwen-VL image processing is unavailable") from exc
     height, width = smart_resize(
-        image.height,
-        image.width,
+        image_size[1],
+        image_size[0],
         factor=32,
         min_pixels=MIN_PIXELS,
         max_pixels=MAX_PIXELS,
@@ -36,8 +36,8 @@ def _smart_size(image: Image.Image) -> tuple[int, int]:
 
 
 def prepare_images(request: AdapterInput) -> tuple[Image.Image, Image.Image]:
-    reference_size = _smart_size(request.reference_image)
-    target_size = _smart_size(request.target_image)
+    reference_size = smart_image_size(request.reference_image.size)
+    target_size = smart_image_size(request.target_image.size)
     reference = request.reference_image.resize(reference_size, Image.Resampling.BICUBIC)
     target = request.target_image.resize(target_size, Image.Resampling.BICUBIC)
     scale_x = reference.width / request.reference_image.width

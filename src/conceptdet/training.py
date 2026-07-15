@@ -37,6 +37,7 @@ from conceptdet.model import (
     MIN_VISUAL_TOKENS,
     Qwen3VLAdapter,
     prepare_images,
+    smart_image_size,
 )
 from conceptdet.peft_weights import load_exact_adapter_weights
 from conceptdet.prompts import build_messages
@@ -133,6 +134,25 @@ class SFTBatchBuilder:
     def __init__(self, dataset: DatasetArtifact, processor: Any) -> None:
         self.dataset = dataset
         self.processor = processor
+        self._prepared_size_cache: dict[Path, tuple[int, int]] = {}
+
+    def _prepared_size(self, path: Path) -> tuple[int, int]:
+        cached = self._prepared_size_cache.get(path)
+        if cached is not None:
+            return cached
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(path) as opened:
+                    width, height = opened.size
+                    orientation = int(opened.getexif().get(274, 1))
+        except (OSError, TypeError, ValueError) as exc:
+            raise DatasetError(f"Cannot read training image metadata: {path}") from exc
+        if orientation in {5, 6, 7, 8}:
+            width, height = height, width
+        prepared = smart_image_size((width, height))
+        self._prepared_size_cache[path] = prepared
+        return prepared
 
     def build(self, record: dict[str, Any]) -> tuple[Any, BatchProvenance]:
         try:
@@ -202,6 +222,77 @@ class SFTBatchBuilder:
                     f"Image grid {grid} produces {visual_tokens} visual tokens outside contract"
                 )
         return batch, BatchProvenance(
+            str(record["id"]),
+            bool(record["positive"]),
+            total_tokens,
+            prompt_tokens,
+            completion_tokens,
+            grids,
+        )
+
+    def preflight(self, record: dict[str, Any]) -> BatchProvenance:
+        """Compute exact token/grid limits without allocating model pixel tensors."""
+
+        request = detection_request(self.dataset, record)
+        raw_detection_set = record.get("detection_set")
+        if not isinstance(raw_detection_set, list):
+            raise DatasetError(f"Training record has no Detection Set: {record.get('id')}")
+        answer = json.dumps(
+            raw_detection_set, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        detections = parse_detection_set(answer)
+        if serialize_detection_set(detections) != answer:
+            raise DatasetError(
+                f"Training record is not canonically serialized: {record.get('id')}"
+            )
+
+        sizes = [
+            self._prepared_size(path)
+            for path in (request.reference_image, request.target_image)
+        ]
+        patch_size = int(self.processor.image_processor.patch_size)
+        merge_size = int(self.processor.image_processor.merge_size)
+        grids = tuple((1, height // patch_size, width // patch_size) for width, height in sizes)
+        visual_tokens = [grid[1] * grid[2] // (merge_size**2) for grid in grids]
+        if any(
+            not MIN_VISUAL_TOKENS <= count <= MAX_VISUAL_TOKENS
+            for count in visual_tokens
+        ):
+            raise TrainingError(f"Preflight image grids produce invalid tokens: {grids}")
+
+        placeholder = Image.new("RGB", (1, 1))
+        prompt_messages = build_messages(placeholder, placeholder, request.query)
+        full_messages = [*prompt_messages, {"role": "assistant", "content": answer}]
+
+        def expanded_tokens(messages: list[dict[str, Any]], generation: bool) -> int:
+            rendered = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=generation,
+                add_vision_id=True,
+            )
+            token_ids = self.processor.tokenizer(
+                rendered, add_special_tokens=False
+            )["input_ids"]
+            image_token_id = int(self.processor.image_token_id)
+            if token_ids.count(image_token_id) != 2:
+                raise TrainingError("SFT preflight expected exactly two image placeholders")
+            return len(token_ids) - 2 + sum(visual_tokens)
+
+        prompt_tokens = expanded_tokens(prompt_messages, True)
+        total_tokens = expanded_tokens(full_messages, False)
+        completion_tokens = total_tokens - prompt_tokens
+        if total_tokens > MAX_TOTAL_SEQUENCE_TOKENS:
+            raise DatasetError(
+                f"Record {record.get('id')} has {total_tokens} tokens; "
+                f"maximum is {MAX_TOTAL_SEQUENCE_TOKENS} and truncation is forbidden"
+            )
+        if not 1 <= completion_tokens <= 192:
+            raise DatasetError(
+                f"Record {record.get('id')} completion has {completion_tokens} tokens; "
+                "expected 1-192"
+            )
+        return BatchProvenance(
             str(record["id"]),
             bool(record["positive"]),
             total_tokens,
@@ -304,7 +395,7 @@ def _compatible_sft_schedule(
     selected: dict[bool, dict[str, Any]] = {}
     for record in schedule:
         try:
-            builder.build(record)
+            builder.preflight(record)
         except DatasetError as exc:
             message = str(exc)
             if "truncation is forbidden" not in message and "expected 1-192" not in message:

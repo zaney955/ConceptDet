@@ -14,6 +14,7 @@ from conceptdet.artifact import (
 )
 from conceptdet.config import (
     ArtifactInitConfig,
+    DatasetPredictionConfig,
     DataVocConfig,
     EvaluationConfig,
     GRPOOptimizationConfig,
@@ -297,6 +298,44 @@ def test_evaluate_cli_forwards_worker_count(tmp_path: Path, monkeypatch, capsys)
     assert json.loads(capsys.readouterr().out)["evaluation_fingerprint"] == (
         "evaluation-hash"
     )
+
+
+def test_predict_dataset_cli_reports_complete_output(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import conceptdet.prediction as prediction
+
+    config = DatasetPredictionConfig(
+        1,
+        "predict.dataset",
+        tmp_path / "dataset",
+        tmp_path / "adapter",
+        tmp_path / "predictions.jsonl",
+        "test",
+        RuntimeConfig(max_new_tokens=128),
+        tmp_path / "predict.yaml",
+        "config-hash",
+    )
+
+    def fake_predict(_: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            path=config.predictions,
+            records=713,
+            content_sha256="prediction-hash",
+        )
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(prediction, "generate_dataset_predictions", fake_predict)
+    assert (
+        cli.main(["predict", "dataset", "--config", str(config.config_path)])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "predictions": str(config.predictions),
+        "records": 713,
+        "content_sha256": "prediction-hash",
+    }
 
 
 def test_train_grpo_cli_uses_separate_stage_and_forwards_resume(

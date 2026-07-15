@@ -4,6 +4,7 @@ import pytest
 
 from conceptdet.config import (
     ArtifactInitConfig,
+    DatasetPredictionConfig,
     DataVocConfig,
     DetectConfig,
     EvaluationConfig,
@@ -184,3 +185,25 @@ output_dir: evaluation
         "output_dir",
         "config_hash",
     }
+
+
+def test_dataset_prediction_config_is_typed_and_resolved(tmp_path: Path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "predict.yaml",
+            """
+schema_version: 1
+kind: predict.dataset
+dataset_dir: compiled
+artifact: adapter
+predictions: predictions.jsonl
+split: test
+runtime: {device: auto, max_new_tokens: 128, local_files_only: true}
+""",
+        )
+    )
+    assert isinstance(config, DatasetPredictionConfig)
+    assert config.dataset_dir == (tmp_path / "compiled").resolve()
+    assert config.predictions == (tmp_path / "predictions.jsonl").resolve()
+    assert config.runtime.max_new_tokens == 128
+    assert config_to_dict(config)["kind"] == "predict.dataset"

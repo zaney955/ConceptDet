@@ -18,6 +18,7 @@ from conceptdet.artifact import (
 from conceptdet.config import (
     ArtifactInitConfig,
     BatchConfig,
+    DatasetPredictionConfig,
     DataVocConfig,
     DetectConfig,
     EvaluationConfig,
@@ -94,6 +95,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="none, auto, or an explicit complete checkpoint directory",
     )
+    predict = domains.add_parser(
+        "predict", help="Generate raw predictions for a compiled dataset split"
+    )
+    predict_commands = predict.add_subparsers(dest="operation", required=True)
+    _config_argument(
+        predict_commands.add_parser("dataset", help="Predict one complete dataset split")
+    )
     evaluate = domains.add_parser(
         "evaluate", help="Evaluate saved strict Detection Set predictions"
     )
@@ -129,6 +137,7 @@ def _validate_resources(
         | DataVocConfig
         | SFTStageConfig
         | GRPOStageConfig
+        | DatasetPredictionConfig
         | EvaluationConfig
     ),
 ) -> None:
@@ -179,6 +188,13 @@ def _validate_resources(
         from conceptdet.grpo import validate_grpo_inputs
 
         validate_grpo_inputs(config)
+    elif isinstance(config, DatasetPredictionConfig):
+        DatasetArtifact.load(config.dataset_dir)
+        AdapterArtifact.load(config.artifact)
+        if config.predictions.exists():
+            raise EvaluationError(
+                f"Prediction output already exists: {config.predictions}"
+            )
     else:
         from conceptdet.evaluation import EvaluationArtifact
 
@@ -424,6 +440,26 @@ def _execute(args: argparse.Namespace) -> int:
 
         if ProcessContext.current().is_main:
             print(json.dumps(payload))
+        return 0
+
+    if args.domain == "predict":
+        if not isinstance(config, DatasetPredictionConfig):
+            raise ConfigurationError("predict dataset requires kind: predict.dataset")
+        from conceptdet.prediction import generate_dataset_predictions
+
+        result = generate_dataset_predictions(config)
+        from conceptdet.run_state import ProcessContext
+
+        if ProcessContext.current().is_main:
+            print(
+                json.dumps(
+                    {
+                        "predictions": str(result.path),
+                        "records": result.records,
+                        "content_sha256": result.content_sha256,
+                    }
+                )
+            )
         return 0
 
     if args.domain == "evaluate":

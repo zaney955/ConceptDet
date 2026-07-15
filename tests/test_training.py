@@ -62,7 +62,7 @@ def test_sft_order_reaches_negative_records_in_first_cycle() -> None:
 
 def test_sft_schedule_excludes_only_contract_overlength_records() -> None:
     class _Builder:
-        def build(self, record: dict[str, object]) -> None:
+        def preflight(self, record: dict[str, object]) -> None:
             if record["id"] == "long":
                 raise DatasetError("Record long has 1537 tokens; truncation is forbidden")
 
@@ -80,7 +80,7 @@ def test_sft_schedule_excludes_only_contract_overlength_records() -> None:
 
 def test_sft_smoke_schedule_frontloads_positive_and_negative() -> None:
     class _Builder:
-        def build(self, record: dict[str, object]) -> None:
+        def preflight(self, record: dict[str, object]) -> None:
             return None
 
     records = [
