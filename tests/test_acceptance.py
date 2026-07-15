@@ -1,7 +1,14 @@
 import json
 from pathlib import Path
 
-from conceptdet.acceptance import assemble_acceptance_report
+from conceptdet.acceptance import _distributed_world_size, assemble_acceptance_report
+
+
+def test_d1_accepts_any_real_multi_process_world_size() -> None:
+    assert _distributed_world_size(2)
+    assert _distributed_world_size(4)
+    assert not _distributed_world_size(1)
+    assert not _distributed_world_size(True)
 
 
 def test_mandatory_skipped_gate_never_counts_as_pass(tmp_path: Path) -> None:

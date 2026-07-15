@@ -119,6 +119,10 @@ def _read_json(path: Path, description: str) -> dict[str, Any]:
     return payload
 
 
+def _distributed_world_size(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 2
+
+
 def emit_hardware_gate_report(
     *,
     gate: Literal["H1", "H2", "D1"],
@@ -160,8 +164,9 @@ def emit_hardware_gate_report(
         "parent_artifact_fingerprint"
     ):
         diagnostics.append("GRPO parent Artifact lineage mismatch")
-    if gate == "D1" and lifecycle.get("world_size") != 2:
-        diagnostics.append("D1 requires world_size=2")
+    world_size = lifecycle.get("world_size")
+    if gate == "D1" and not _distributed_world_size(world_size):
+        diagnostics.append("D1 requires world_size>=2")
     payload = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "profile": "hardware-gate",
