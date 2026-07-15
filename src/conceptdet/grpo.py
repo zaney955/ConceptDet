@@ -13,10 +13,16 @@ from pathlib import Path
 from typing import Any, Literal
 
 from PIL import Image, ImageOps
+from transformers import TrainerCallback
 
 from conceptdet.adapter import AdapterInput
 from conceptdet.application import DetectionApplication
-from conceptdet.artifact import MODEL_ID, MODEL_REVISION, AdapterArtifact, initialize_artifact
+from conceptdet.artifact import (
+    MODEL_ID,
+    MODEL_REVISION,
+    AdapterArtifact,
+    initialize_artifact,
+)
 from conceptdet.config import ArtifactInitConfig, GRPOStageConfig
 from conceptdet.dataset import (
     DatasetArtifact,
@@ -32,13 +38,26 @@ from conceptdet.model import (
     Qwen3VLAdapter,
     prepare_images,
 )
+from conceptdet.peft_weights import load_exact_adapter_weights
 from conceptdet.prompts import STRICT_DETECTION_PROMPT, build_messages
 from conceptdet.protocol import parse_detection_set, serialize_detection_set
+from conceptdet.run_state import (
+    ProcessContext,
+    RunIdentity,
+    assert_distributed_consensus,
+    code_fingerprint,
+    distributed_barrier,
+    distributed_objects,
+    load_checkpoint_metadata,
+    resolve_resume,
+    write_checkpoint_metadata,
+)
 from conceptdet.types import Box
 
 MEMORY_GATE_GIB = 44.0
 NUM_GENERATIONS = 2
 MAX_COMPLETION_TOKENS = 192
+GRPO_TEMPERATURE = 1.2
 EXPECTED_TRL_VERSION = "1.5.0"
 
 
@@ -229,30 +248,42 @@ def _ordered_records(records: list[dict[str, Any]], seed: int) -> list[dict[str,
 
 
 def _frontload_compatible_smoke_records(
-    records: list[dict[str, Any]], builder: GRPOBatchBuilder
-) -> tuple[list[dict[str, Any]], tuple[GRPOBatchProvenance, GRPOBatchProvenance]]:
+    records: list[dict[str, Any]],
+    builder: GRPOBatchBuilder,
+    *,
+    required_records: int | None,
+) -> tuple[
+    list[dict[str, Any]],
+    tuple[GRPOBatchProvenance, GRPOBatchProvenance],
+    list[str],
+]:
     selected: dict[bool, tuple[dict[str, Any], GRPOBatchProvenance]] = {}
-    for record in records:
+    compatible: list[dict[str, Any]] = []
+    excluded: list[str] = []
+    stopping_count = max(2, required_records) if required_records is not None else None
+    for index, record in enumerate(records):
         kind = bool(record["positive"])
-        if kind in selected:
-            continue
         try:
             _, provenance = builder.preflight(record)
         except DatasetError as exc:
             if "prompt + 192" not in str(exc):
                 raise
+            excluded.append(str(record["id"]))
             continue
-        selected[kind] = (record, provenance)
-        if len(selected) == 2:
+        compatible.append(record)
+        selected.setdefault(kind, (record, provenance))
+        if (
+            stopping_count is not None
+            and len(compatible) >= stopping_count
+            and set(selected) == {False, True}
+        ):
+            compatible.extend(records[index + 1 :])
             break
     if set(selected) != {False, True}:
         raise TrainingError(
             "Could not find both positive and negative GRPO records within the 1,536-token contract"
         )
-    front = [selected[True][0], selected[False][0]]
-    selected_ids = {str(record["id"]) for record in front}
-    remaining = [record for record in records if str(record["id"]) not in selected_ids]
-    return [*front, *remaining], (selected[True][1], selected[False][1])
+    return compatible, (selected[True][1], selected[False][1]), excluded
 
 
 def _completion_text(completion: Any) -> str:
@@ -314,6 +345,38 @@ class _RewardRecorder:
         )
 
 
+class _CheckpointMetadataCallback(TrainerCallback):
+    """Adds ConceptDet's fail-closed identity marker after stock Trainer saves state."""
+
+    def __init__(self, identity: RunIdentity) -> None:
+        self.identity = identity
+
+    def on_save(self, args: Any, state: Any, control: Any, **_: Any) -> Any:
+        if state.is_world_process_zero:
+            checkpoint = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+            write_checkpoint_metadata(
+                checkpoint,
+                self.identity,
+                {"optimizer_step": int(state.global_step)},
+            )
+            (checkpoint / "complete").write_text("complete\n", encoding="utf-8")
+        return control
+
+
+def _resolve_grpo_resume(
+    work_dir: Path, resume: Literal["none", "auto"] | Path
+) -> Path | None:
+    if resume == "none":
+        if work_dir.exists() and any(work_dir.iterdir()):
+            raise TrainingError(
+                f"GRPO work directory is not empty; use --resume auto or a checkpoint: {work_dir}"
+            )
+        return None
+    if resume == "auto":
+        return resolve_resume(work_dir / "trainer", "auto", stage="grpo")
+    return resolve_resume(work_dir / "trainer", Path(resume), stage="grpo")
+
+
 def _trainable_digest(model: Any) -> str:
     digest = hashlib.sha256()
     for name, parameter in sorted(model.named_parameters()):
@@ -321,6 +384,15 @@ def _trainable_digest(model: Any) -> str:
             digest.update(name.encode())
             digest.update(parameter.detach().float().cpu().contiguous().numpy().tobytes())
     return digest.hexdigest()
+
+
+def _trainable_parameter_digests(model: Any) -> list[tuple[str, str]]:
+    values: list[tuple[str, str]] = []
+    for name, parameter in sorted(model.named_parameters()):
+        if parameter.requires_grad:
+            payload = parameter.detach().float().cpu().contiguous().numpy().tobytes()
+            values.append((name, hashlib.sha256(payload).hexdigest()))
+    return values
 
 
 def _memory(torch: Any, device: Any, checkpoint: str) -> dict[str, float | str]:
@@ -361,11 +433,10 @@ def run_grpo(
     *,
     resume: Literal["none", "auto"] | Path = "none",
 ) -> GRPOResult:
-    if resume != "none":
-        raise TrainingError("GRPO resume is reserved for distributed/resume ticket #21")
     try:
         import torch
         import trl
+        from accelerate import Accelerator
         from datasets import Dataset
         from peft import PeftModel
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
@@ -380,16 +451,39 @@ def run_grpo(
         )
     if not torch.cuda.is_available():
         raise TrainingError("Qwen3-VL GRPO requires CUDA")
-    device_name = "cuda:0" if config.runtime.device == "auto" else config.runtime.device
+    context = ProcessContext.current()
+    bootstrap_accelerator = Accelerator() if context.distributed else None
+    device_name = context.cuda_device(config.runtime.device)
     if not device_name.startswith("cuda"):
         raise TrainingError("Qwen3-VL GRPO requires a CUDA device")
     if config.runtime.dtype not in {"auto", "bfloat16"}:
         raise TrainingError("Qwen3-VL GRPO supports bfloat16 only")
-    if config.work_dir.exists() and any(config.work_dir.iterdir()):
-        raise TrainingError(f"GRPO work directory must be empty: {config.work_dir}")
+    resume_path = _resolve_grpo_resume(config.work_dir, resume)
 
     dataset, parent, validation = validate_grpo_inputs(config)
-    device = torch.device(device_name)
+    identity = RunIdentity(
+        "grpo",
+        config.config_hash,
+        dataset.fingerprint,
+        str(parent.contract["contract_fingerprint"]),
+        parent.fingerprint,
+        code_fingerprint(
+            Path(__file__),
+            Path(__file__).with_name("evaluation.py"),
+            Path(__file__).with_name("model.py"),
+            Path(__file__).with_name("peft_weights.py"),
+            Path(__file__).with_name("prompts.py"),
+            Path(__file__).with_name("protocol.py"),
+        ),
+        context.world_size,
+    )
+    if resume_path is not None:
+        load_checkpoint_metadata(resume_path, identity)
+    device = (
+        bootstrap_accelerator.device
+        if bootstrap_accelerator is not None
+        else torch.device(device_name)
+    )
     torch.cuda.set_device(device)
     torch.manual_seed(config.optimization.seed)
     torch.cuda.manual_seed_all(config.optimization.seed)
@@ -397,6 +491,12 @@ def run_grpo(
     torch.cuda.reset_peak_memory_stats(device)
     memory_points = [_memory(torch, device, "process_start")]
     config.work_dir.mkdir(parents=True, exist_ok=True)
+    assert_distributed_consensus(
+        torch,
+        identity.fingerprint,
+        context,
+        name="run identity",
+    )
 
     processor = AutoProcessor.from_pretrained(
         MODEL_ID,
@@ -409,7 +509,13 @@ def run_grpo(
     records = _ordered_records(
         list(dataset.iter_records("train")), config.optimization.seed
     )
-    records, preflight = _frontload_compatible_smoke_records(records, builder)
+    records, preflight, excluded_overlength_records = (
+        _frontload_compatible_smoke_records(
+            records,
+            builder,
+            required_records=config.optimization.max_steps,
+        )
+    )
     lazy_dataset = Dataset.from_dict(
         {
             "record_json": [
@@ -443,6 +549,10 @@ def run_grpo(
         ) from exc
     base.config.use_cache = False
     model = PeftModel.from_pretrained(base, parent.path, is_trainable=True)
+    try:
+        source_adapter_digest = load_exact_adapter_weights(model, parent.path)
+    except ValueError as exc:
+        raise TrainingError(f"Cannot load exact GRPO parent weights: {exc}") from exc
     model.config.use_cache = False
     trainable = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -460,6 +570,22 @@ def run_grpo(
     if unexpected:
         raise TrainingError(f"Non-LoRA GRPO parameters are trainable: {unexpected[:10]}")
     initial_digest = _trainable_digest(model)
+    initial_digests = distributed_objects(torch, initial_digest, context)
+    if any(value != initial_digests[0] for value in initial_digests[1:]):
+        parameter_digests = distributed_objects(
+            torch, _trainable_parameter_digests(model), context
+        )
+        reference = dict(parameter_digests[0])
+        differences = [
+            name
+            for rank_values in parameter_digests[1:]
+            for name, digest in rank_values
+            if reference.get(name) != digest
+        ]
+        raise TrainingError(
+            "Cross-rank initial adapter checksum mismatch; differing parameters: "
+            f"{sorted(set(differences))[:10]}"
+        )
     memory_points.append(_memory(torch, device, "sft_parent_loaded"))
 
     recorder = _RewardRecorder()
@@ -469,6 +595,7 @@ def run_grpo(
         gradient_accumulation_steps=config.optimization.gradient_accumulation_steps,
         generation_batch_size=2,
         num_generations=NUM_GENERATIONS,
+        temperature=GRPO_TEMPERATURE,
         num_train_epochs=config.optimization.epochs,
         max_steps=(config.optimization.max_steps or -1),
         max_completion_length=MAX_COMPLETION_TOKENS,
@@ -491,7 +618,9 @@ def run_grpo(
         log_completions=True,
         num_completions_to_print=2,
         report_to="none",
-        save_strategy="no",
+        save_strategy="steps",
+        save_steps=config.optimization.checkpoint_steps,
+        save_only_model=False,
         disable_tqdm=True,
         dataloader_num_workers=0,
         dataloader_pin_memory=False,
@@ -503,6 +632,7 @@ def run_grpo(
         args=trainer_args,
         train_dataset=lazy_dataset,
         processing_class=processor,
+        callbacks=[_CheckpointMetadataCallback(identity)],
     )
     if trainer.__class__ is not GRPOTrainer:
         raise TrainingError("GRPO must use the stock TRL GRPOTrainer class")
@@ -512,7 +642,9 @@ def run_grpo(
         raise TrainingError("GRPO unexpectedly inherited an optimizer before training")
     memory_points.append(_memory(torch, device, "stock_trainer_ready"))
     try:
-        train_output = trainer.train()
+        train_output = trainer.train(
+            resume_from_checkpoint=str(resume_path) if resume_path is not None else None
+        )
     except torch.OutOfMemoryError as exc:
         raise TrainingError(
             "CUDA out of memory during native GRPO; one prompt group must fit per device"
@@ -531,20 +663,49 @@ def run_grpo(
     if not nonzero_gradient_norm:
         raise TrainingError("GRPO gradient norm remained zero")
     memory_points.append(_memory(torch, device, "native_grpo_complete"))
-    final_digest = _trainable_digest(trainer.model)
+    synchronized_model = trainer.accelerator.unwrap_model(trainer.model)
+    final_digest = _trainable_digest(synchronized_model)
+    final_digests = distributed_objects(torch, final_digest, context)
+    if any(value != final_digests[0] for value in final_digests[1:]):
+        raise TrainingError(f"Final GRPO adapter checksum differs across ranks: {final_digests}")
     if initial_digest == final_digest:
         raise TrainingError("GRPO adapter parameters did not change")
-    if recorder.count < 4 or recorder.kinds != {False, True}:
+    recorder_payloads = distributed_objects(
+        torch,
+        {"events": recorder.events, "values": dict(recorder.values)},
+        context,
+    )
+    all_events = [
+        event
+        for payload in recorder_payloads
+        for event in payload["events"]  # type: ignore[index]
+    ]
+    all_values: dict[str, list[float]] = defaultdict(list)
+    for payload in recorder_payloads:
+        for identity_key, values in payload["values"].items():  # type: ignore[union-attr]
+            all_values[str(identity_key)].extend(float(value) for value in values)
+    reward_event_count = len(all_events)
+    reward_kinds = {bool(event["positive"]) for event in all_events}
+    nonzero_advantage_groups = sum(
+        len(values) >= NUM_GENERATIONS and max(values) - min(values) > 1e-8
+        for values in all_values.values()
+    )
+    if reward_event_count < 4 or reward_kinds != {False, True}:
         raise TrainingError("GRPO reward did not observe four positive/negative completions")
-    if recorder.nonzero_advantage_groups < 1:
+    if nonzero_advantage_groups < 1:
         raise TrainingError("GRPO produced no reward group with nonzero advantage")
 
     final_peft = config.work_dir / "final-peft"
     trainer.save_model(str(final_peft))
+    trainer.accelerator.wait_for_everyone()
     if not (final_peft / "adapter_model.safetensors").is_file():
         raise TrainingError("Stock TRL did not save the GRPO PEFT adapter")
     memory_points.append(_memory(torch, device, "grpo_adapter_saved"))
-    peak_before_reload = max(float(point["peak_reserved_gib"]) for point in memory_points)
+    local_peak_before_reload = max(
+        float(point["peak_reserved_gib"]) for point in memory_points
+    )
+    rank_peaks = distributed_objects(torch, local_peak_before_reload, context)
+    peak_before_reload = max(float(value) for value in rank_peaks)
     if peak_before_reload > MEMORY_GATE_GIB:
         raise TrainingError(
             f"GRPO peak reserved {peak_before_reload:.3f} GiB exceeds {MEMORY_GATE_GIB:.1f} GiB"
@@ -556,6 +717,21 @@ def run_grpo(
     gc.collect()
     torch.cuda.empty_cache()
     memory_points.append(_memory(torch, device, "training_model_released"))
+    if not context.is_main:
+        distributed_barrier(torch, context)
+        artifact = AdapterArtifact.load(config.artifact_dir)
+        lifecycle_path = config.work_dir / "lifecycle.json"
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        return GRPOResult(
+            artifact,
+            int(lifecycle["optimizer_steps"]),
+            int(lifecycle["reward_event_count"]),
+            int(lifecycle["nonzero_advantage_groups"]),
+            float(lifecycle["peak_reserved_gib"]),
+            str(lifecycle["positive_completion"]),
+            str(lifecycle["negative_completion"]),
+            lifecycle_path,
+        )
 
     candidate = config.artifact_dir.parent / f".{config.artifact_dir.name}.candidate"
     if candidate.exists():
@@ -578,21 +754,24 @@ def run_grpo(
             "parent_adapter_file_sha256": parent.summary["files"][
                 "adapter_model.safetensors"
             ],
+            "parent_loaded_adapter_digest": source_adapter_digest,
             "optimizer_inherited": False,
             "trainer_class": trainer_class,
             "trl_version": EXPECTED_TRL_VERSION,
             "beta": 0.0,
             "num_generations": NUM_GENERATIONS,
+            "temperature": GRPO_TEMPERATURE,
             "max_completion_tokens": MAX_COMPLETION_TOKENS,
             "optimizer_steps": optimizer_steps,
-            "reward_events": recorder.count,
-            "nonzero_advantage_groups": recorder.nonzero_advantage_groups,
+            "reward_events": reward_event_count,
+            "nonzero_advantage_groups": nonzero_advantage_groups,
             "nonzero_gradient_norm": nonzero_gradient_norm,
             "maximum_gradient_norm": max(gradient_norms),
             "initial_trainable_digest": initial_digest,
             "final_trainable_digest": final_digest,
             "peak_reserved_gib_before_reload": peak_before_reload,
             "trainable_parameters": trainable,
+            "excluded_overlength_records": excluded_overlength_records,
         },
     )
 
@@ -635,14 +814,16 @@ def run_grpo(
         "beta": 0.0,
         "reference_model": False,
         "num_generations": NUM_GENERATIONS,
+        "temperature": GRPO_TEMPERATURE,
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
         "optimizer_inherited": False,
+        "parent_loaded_adapter_digest": source_adapter_digest,
         "optimizer_steps": optimizer_steps,
         "train_metrics": metrics,
         "trainer_log_history": log_history,
-        "reward_events": recorder.events,
-        "reward_event_count": recorder.count,
-        "nonzero_advantage_groups": recorder.nonzero_advantage_groups,
+        "reward_events": all_events,
+        "reward_event_count": reward_event_count,
+        "nonzero_advantage_groups": nonzero_advantage_groups,
         "nonzero_gradient_norm": nonzero_gradient_norm,
         "maximum_gradient_norm": max(gradient_norms),
         "initial_trainable_digest": initial_digest,
@@ -650,6 +831,7 @@ def run_grpo(
         "adapter_parameters_changed": initial_digest != final_digest,
         "trainable_parameters": trainable,
         "preflight": [asdict(item) for item in preflight],
+        "excluded_overlength_records": excluded_overlength_records,
         "smoke_max_new_tokens": smoke_max_new_tokens,
         "positive_record_id": positive_record["id"],
         "positive_completion": positive_result.raw_completion,
@@ -658,16 +840,30 @@ def run_grpo(
         "peak_reserved_gib": peak_reserved,
         "memory_gate_gib": MEMORY_GATE_GIB,
         "memory": memory_points,
+        "world_size": context.world_size,
+        "rank_peak_reserved_gib_before_reload": rank_peaks,
+        "final_adapter_digests": final_digests,
     }
     lifecycle_path = config.work_dir / "lifecycle.json"
     lifecycle_path.write_text(
         json.dumps(lifecycle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    from conceptdet.acceptance import emit_hardware_gate_report
+
+    emit_hardware_gate_report(
+        gate="H2" if context.world_size == 1 else "D1",
+        lifecycle_path=lifecycle_path,
+        artifact_path=artifact.path,
+        config_hash=config.config_hash,
+        dataset_fingerprint=dataset.fingerprint,
+        offline=config.runtime.local_files_only,
+    )
+    distributed_barrier(torch, context)
     return GRPOResult(
         artifact,
         optimizer_steps,
-        recorder.count,
-        recorder.nonzero_advantage_groups,
+        reward_event_count,
+        nonzero_advantage_groups,
         peak_reserved,
         positive_result.raw_completion,
         negative_result.raw_completion,

@@ -6,7 +6,11 @@ from PIL import Image
 
 from conceptdet.errors import DatasetError
 from conceptdet.evaluation import score_detection_reward
-from conceptdet.grpo import GRPOBatchBuilder, _ordered_records
+from conceptdet.grpo import (
+    GRPOBatchBuilder,
+    _frontload_compatible_smoke_records,
+    _ordered_records,
+)
 from conceptdet.types import Box
 
 
@@ -76,6 +80,33 @@ def test_grpo_schedule_frontloads_positive_and_negative_groups() -> None:
         False,
     ]
     assert {record["id"] for record in ordered} == {record["id"] for record in records}
+
+
+def test_grpo_full_preflight_excludes_overlength_without_truncation(
+    tmp_path: Path,
+) -> None:
+    positive = _record(tmp_path, positive=True)
+    negative = _record(tmp_path, positive=False)
+    overlength = {**positive, "id": "overlength", "query": "overlength"}
+
+    class _VariableProcessor(_Processor):
+        def apply_chat_template(
+            self, messages: object, *_: object, **__: object
+        ) -> dict[str, torch.Tensor]:
+            tokens = 1345 if "overlength" in str(messages) else 100
+            return {
+                "input_ids": torch.ones((1, tokens), dtype=torch.long),
+                "image_grid_thw": torch.tensor([[1, 16, 16], [1, 16, 16]]),
+                "pixel_values": torch.zeros((2, 3, 4, 4)),
+            }
+
+    compatible, _, excluded = _frontload_compatible_smoke_records(
+        [overlength, positive, negative],
+        GRPOBatchBuilder(_Dataset(), _VariableProcessor()),  # type: ignore[arg-type]
+        required_records=None,
+    )
+    assert [record["id"] for record in compatible] == ["positive", "negative"]
+    assert excluded == ["overlength"]
 
 
 def test_grpo_reward_reuses_strict_soft_set_f1_contract() -> None:

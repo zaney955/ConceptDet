@@ -8,8 +8,7 @@ every matching Target Instance as a strict JSON Detection Set.
 The runtime is a clean break from ConceptSeg: there is no SAM, mask conversion,
 learnable query, connector, projection, fixed 600×600 input, or Qwen2.5
 compatibility path. The model-visible preprocessing and output contract are
-shared by deterministic VOC conversion, bbox SFT, inference, and the future
-GRPO stage.
+shared by deterministic VOC conversion, bbox SFT, inference, and native GRPO.
 
 ## Contract
 
@@ -113,7 +112,9 @@ generation: `beta=0`, no reference model, no vLLM, exactly two generations,
 and a 192-token completion budget. The Dataset Module lazily emits a raw
 conversation, ordered `[Reference Image, Target Image]`, and normalized truth;
 the same Qwen processor owns tokenization and forward recomputation. Every
-record must satisfy prompt + 192 ≤ 1,536; truncation remains forbidden.
+record must satisfy prompt + 192 ≤ 1,536; truncation remains forbidden. Full
+runs preflight the complete split and record excluded overlength IDs in the
+immutable lifecycle report.
 
 Reward is exactly 10% strict Detection Set format plus 90% soft Set-F1 from the
 Evaluation Module. Invalid JSON receives zero; duplicate boxes, misses, and
@@ -121,8 +122,31 @@ false positives reduce soft Set-F1; correct empty/empty receives 1.0. A run is
 published only if the callback sees positive and negative groups, at least one
 group has nonzero advantage, LoRA parameters change, save/release/reload strict
 generation succeeds, parent lineage is exact, and peak reserved memory remains
-at most 44 GiB. `max_steps: null` selects the configured full epoch. GRPO resume
-other than `none` remains fail-closed until #21 completes resume certification.
+at most 44 GiB. `max_steps: null` selects the configured full epoch.
+
+GRPO supports `--resume none|auto|PATH`. A complete stock-Trainer checkpoint
+is accepted only when configuration, dataset, contract, parent Artifact,
+training semantics, and process topology match exactly; partial checkpoints
+are ignored by `auto` and rejected when named explicitly.
+
+## Acceptance gates and distributed launch
+
+Checked-in Accelerate profiles cover a two-process CPU Fake Adapter run and
+two-GPU DDP without embedding GPU selection in source or training config:
+
+```bash
+.venv/bin/accelerate launch --config_file configs/accelerate/cpu-two-process.yaml \
+  -m conceptdet.distributed_fake --output /tmp/conceptdet-c2 --steps 2
+make accept-cpu OUTPUT=/tmp/conceptdet-evidence/cpu_acceptance_report.json
+make accept-pr EVIDENCE=/tmp/conceptdet-evidence \
+  OUTPUT=/tmp/conceptdet-evidence/pr_acceptance_report.json
+```
+
+`accept assemble` exposes separate `pr`, `release`, and `distributed`
+profiles. Mandatory missing/skipped gates fail closed. Hardware lifecycle and
+evaluation runs emit `acceptance_report.json` with immutable hashes and enforce
+offline execution, no SAM runtime imports, strict outputs, finite numerics,
+atomic publication, and the global 44 GiB peak-reserved limit.
 
 ## Wrap a PEFT adapter as an Artifact
 

@@ -7,7 +7,6 @@ import math
 import os
 import re
 import shutil
-import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +21,7 @@ from conceptdet.artifact import (
     MODEL_REVISION,
     TARGET_MODULES_SHA256,
     AdapterArtifact,
+    default_contract,
     initialize_artifact,
 )
 from conceptdet.config import ArtifactInitConfig, RequestConfig, SFTStageConfig
@@ -38,8 +38,24 @@ from conceptdet.model import (
     Qwen3VLAdapter,
     prepare_images,
 )
+from conceptdet.peft_weights import load_exact_adapter_weights
 from conceptdet.prompts import build_messages
 from conceptdet.protocol import parse_detection_set, serialize_detection_set
+from conceptdet.run_state import (
+    ProcessContext,
+    RunIdentity,
+    atomic_checkpoint_directory,
+    capture_rng_state,
+    code_fingerprint,
+    complete_checkpoints,
+    distributed_barrier,
+    distributed_objects,
+    load_checkpoint_metadata,
+    publish_checkpoint,
+    resolve_resume,
+    restore_rng_state,
+    write_checkpoint_metadata,
+)
 
 EXPECTED_TARGET_MODULES = 260
 EXPECTED_TRAINABLE_PARAMETERS = 44_793_856
@@ -246,30 +262,82 @@ def _checkpoint_path(work_dir: Path, optimizer_step: int) -> Path:
 
 
 def _latest_checkpoint(work_dir: Path) -> Path | None:
-    candidates = sorted(
-        path
-        for path in work_dir.glob("checkpoint-*")
-        if path.is_dir() and (path / "state.json").is_file()
-    )
+    candidates = complete_checkpoints(work_dir)
     return candidates[-1] if candidates else None
 
 
 def _resolve_resume(work_dir: Path, resume: Literal["none", "auto"] | Path) -> Path | None:
-    if resume == "none":
-        if work_dir.exists() and any(work_dir.iterdir()):
-            raise TrainingError(
-                f"SFT work directory is not empty; use --resume auto or a checkpoint: {work_dir}"
-            )
-        return None
-    if resume == "auto":
-        checkpoint = _latest_checkpoint(work_dir)
-        if checkpoint is None:
-            raise TrainingError(f"No resumable checkpoint in {work_dir}")
-        return checkpoint
-    checkpoint = Path(resume).expanduser().resolve()
-    if not (checkpoint / "state.json").is_file():
-        raise TrainingError(f"Resume checkpoint is invalid: {checkpoint}")
-    return checkpoint
+    return resolve_resume(work_dir, resume, stage="sft")
+
+
+def _run_identity(
+    config: SFTStageConfig, dataset: DatasetArtifact, context: ProcessContext
+) -> RunIdentity:
+    return RunIdentity(
+        "sft",
+        config.config_hash,
+        dataset.fingerprint,
+        str(default_contract()["contract_fingerprint"]),
+        None,
+        code_fingerprint(
+            Path(__file__),
+            Path(__file__).with_name("model.py"),
+            Path(__file__).with_name("peft_weights.py"),
+            Path(__file__).with_name("prompts.py"),
+            Path(__file__).with_name("protocol.py"),
+        ),
+        context.world_size,
+    )
+
+
+def _compatible_sft_schedule(
+    schedule: list[dict[str, Any]],
+    builder: SFTBatchBuilder,
+    *,
+    required_micro_steps: int | None,
+    require_both_kinds: bool = True,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate the exact model-visible sequence without ever truncating a record."""
+
+    compatible: list[dict[str, Any]] = []
+    excluded: list[str] = []
+    selected: dict[bool, dict[str, Any]] = {}
+    for record in schedule:
+        try:
+            builder.build(record)
+        except DatasetError as exc:
+            message = str(exc)
+            if "truncation is forbidden" not in message and "expected 1-192" not in message:
+                raise
+            excluded.append(str(record["id"]))
+            continue
+        compatible.append(record)
+        selected.setdefault(bool(record["positive"]), record)
+        enough_kinds = not require_both_kinds or set(selected) == {False, True}
+        if (
+            required_micro_steps is not None
+            and len(compatible) >= required_micro_steps
+            and enough_kinds
+        ):
+            break
+    if required_micro_steps is not None and len(compatible) < required_micro_steps:
+        raise TrainingError(
+            f"Only {len(compatible)} compatible SFT records remain; "
+            f"{required_micro_steps} are required"
+        )
+    if not compatible:
+        raise TrainingError("SFT has no records within the 1,536-token contract")
+    if required_micro_steps is not None:
+        if require_both_kinds and set(selected) != {False, True}:
+            raise TrainingError("SFT smoke schedule has no compatible positive/negative pair")
+        if require_both_kinds:
+            front = [selected[True], selected[False]]
+            compatible = [
+                *front,
+                *(record for record in compatible if record not in front),
+            ]
+        compatible = compatible[:required_micro_steps]
+    return compatible, excluded
 
 
 def _save_checkpoint(
@@ -278,11 +346,13 @@ def _save_checkpoint(
     scheduler: Any,
     work_dir: Path,
     state: dict[str, Any],
+    identity: RunIdentity,
+    rng_states: list[object] | None = None,
 ) -> Path:
     target = _checkpoint_path(work_dir, int(state["optimizer_step"]))
-    if target.exists():
-        raise TrainingError(f"Checkpoint already exists: {target}")
-    temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=work_dir))
+    temporary, target = atomic_checkpoint_directory(
+        work_dir, int(state["optimizer_step"])
+    )
     try:
         model.save_pretrained(temporary, safe_serialization=True)
         import torch
@@ -291,10 +361,12 @@ def _save_checkpoint(
             {"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()},
             temporary / "optimizer.pt",
         )
-        (temporary / "state.json").write_text(
-            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        torch.save(
+            {"ranks": rng_states or [capture_rng_state(torch)]},
+            temporary / "rng.pt",
         )
-        os.replace(temporary, target)
+        write_checkpoint_metadata(temporary, identity, state)
+        publish_checkpoint(temporary, target)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
@@ -302,23 +374,9 @@ def _save_checkpoint(
 
 
 def _load_state(
-    checkpoint: Path, config: SFTStageConfig, dataset: DatasetArtifact
+    checkpoint: Path, identity: RunIdentity
 ) -> dict[str, Any]:
-    try:
-        state = json.loads((checkpoint / "state.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise TrainingError(f"Cannot read checkpoint state: {checkpoint}") from exc
-    expected = {
-        "config_hash": config.config_hash,
-        "dataset_fingerprint": dataset.fingerprint,
-        "base_model_revision": MODEL_REVISION,
-    }
-    for key, value in expected.items():
-        if state.get(key) != value:
-            raise TrainingError(
-                f"Checkpoint {key}={state.get(key)!r} does not match {value!r}"
-            )
-    return state
+    return load_checkpoint_metadata(checkpoint, identity)
 
 
 def _request_from_training_record(
@@ -332,6 +390,7 @@ def run_sft(
 ) -> SFTResult:
     try:
         import torch
+        from accelerate import Accelerator
         from peft import LoraConfig, PeftModel, get_peft_model
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
     except ImportError as exc:
@@ -340,15 +399,14 @@ def run_sft(
         ) from exc
     if not torch.cuda.is_available():
         raise TrainingError("Qwen3-VL SFT requires CUDA")
-    if config.runtime.device == "auto":
-        device_name = "cuda:0"
-    else:
-        device_name = config.runtime.device
+    context = ProcessContext.current()
+    accelerator = Accelerator() if context.distributed else None
+    device_name = context.cuda_device(config.runtime.device)
     if not device_name.startswith("cuda"):
         raise TrainingError("Qwen3-VL SFT requires a CUDA device")
     if config.runtime.dtype not in {"auto", "bfloat16"}:
         raise TrainingError("Qwen3-VL SFT supports bfloat16 only")
-    device = torch.device(device_name)
+    device = accelerator.device if accelerator is not None else torch.device(device_name)
     torch.cuda.set_device(device)
     torch.manual_seed(config.optimization.seed)
     torch.cuda.manual_seed_all(config.optimization.seed)
@@ -357,10 +415,17 @@ def run_sft(
 
     dataset = DatasetArtifact.load(config.dataset_dir)
     validation = validate_training_dataset(dataset)
+    identity = _run_identity(config, dataset, context)
     records = list(dataset.iter_records("train"))
     schedule = _schedule(records, config.optimization.epochs, config.optimization.seed)
     if not schedule:
         raise TrainingError("SFT schedule is empty")
+    if context.distributed:
+        schedule = schedule[context.rank :: context.world_size]
+        if not schedule:
+            raise TrainingError(
+                f"SFT rank {context.rank} received no records for world_size={context.world_size}"
+            )
     resume_path = _resolve_resume(config.work_dir, resume)
     if config.artifact_dir.exists():
         raise TrainingError(f"SFT Artifact output already exists: {config.artifact_dir}")
@@ -374,6 +439,25 @@ def run_sft(
         max_pixels=655_360,
         local_files_only=config.runtime.local_files_only,
     )
+    builder = SFTBatchBuilder(dataset, processor)
+    required_micro_steps = (
+        config.optimization.max_steps
+        * config.optimization.gradient_accumulation_steps
+        if config.optimization.max_steps is not None
+        else None
+    )
+    schedule, excluded_overlength_records = _compatible_sft_schedule(
+        schedule,
+        builder,
+        required_micro_steps=required_micro_steps,
+        require_both_kinds=not context.distributed,
+    )
+    schedule_lengths = distributed_objects(torch, len(schedule), context)
+    padded_record_ids: list[str] = []
+    maximum_schedule_length = max(int(value) for value in schedule_lengths)
+    while len(schedule) < maximum_schedule_length:
+        schedule.append(schedule[len(padded_record_ids) % len(schedule)])
+        padded_record_ids.append(str(schedule[-1]["id"]))
     attention = config.runtime.attention
     try:
         model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -416,8 +500,12 @@ def run_sft(
             "seen_negative": False,
         }
     else:
-        state = _load_state(resume_path, config, dataset)
+        state = _load_state(resume_path, identity)
         model = PeftModel.from_pretrained(model, resume_path, is_trainable=True)
+        try:
+            load_exact_adapter_weights(model, resume_path)
+        except ValueError as exc:
+            raise TrainingError(f"Cannot restore exact SFT adapter weights: {exc}") from exc
     model.config.use_cache = False
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -454,7 +542,15 @@ def run_sft(
         payload = torch.load(resume_path / "optimizer.pt", map_location=device, weights_only=True)
         optimizer.load_state_dict(payload["optimizer"])
         scheduler.load_state_dict(payload["scheduler"])
-    builder = SFTBatchBuilder(dataset, processor)
+        rng_payload = torch.load(
+            resume_path / "rng.pt", map_location="cpu", weights_only=False
+        )
+        rank_states = rng_payload.get("ranks") if isinstance(rng_payload, dict) else None
+        if not isinstance(rank_states, list) or len(rank_states) != context.world_size:
+            raise TrainingError("Checkpoint RNG topology does not match this run")
+        restore_rng_state(torch, rank_states[context.rank])
+    if accelerator is not None:
+        model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
     accumulation = config.optimization.gradient_accumulation_steps
     maximum_steps = config.optimization.max_steps
     final_loss = float("nan")
@@ -471,7 +567,10 @@ def run_sft(
         try:
             output = model(**batch)
             loss = output.loss / accumulation
-            loss.backward()
+            if accelerator is None:
+                loss.backward()
+            else:
+                accelerator.backward(loss)
         except torch.OutOfMemoryError as exc:
             raise TrainingError(
                 f"CUDA out of memory on record {provenance.record_id}; "
@@ -502,36 +601,87 @@ def run_sft(
                 "completion_tokens": provenance.completion_tokens,
                 "image_grids": [list(grid) for grid in provenance.image_grids],
             }
-            with metrics_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(metric, sort_keys=True) + "\n")
+            if context.is_main:
+                with metrics_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(metric, sort_keys=True) + "\n")
             memory_points.append(
                 _memory(torch, device, f"optimizer_step_{state['optimizer_step']}")
             )
             if int(state["optimizer_step"]) % config.optimization.checkpoint_steps == 0:
-                _save_checkpoint(model, optimizer, scheduler, config.work_dir, dict(state))
+                seen_by_rank = distributed_objects(
+                    torch, (seen_positive, seen_negative), context
+                )
+                seen_positive = any(bool(value[0]) for value in seen_by_rank)
+                seen_negative = any(bool(value[1]) for value in seen_by_rank)
+                state["seen_positive"] = seen_positive
+                state["seen_negative"] = seen_negative
+                rng_states = distributed_objects(
+                    torch, capture_rng_state(torch), context
+                )
+                if context.is_main:
+                    checkpoint_model = (
+                        accelerator.unwrap_model(model)
+                        if accelerator is not None
+                        else model
+                    )
+                    _save_checkpoint(
+                        checkpoint_model,
+                        optimizer,
+                        scheduler,
+                        config.work_dir,
+                        dict(state),
+                        identity,
+                        rng_states,
+                    )
+                distributed_barrier(torch, context)
         del batch, output, loss
 
     if maximum_steps is not None and int(state["optimizer_step"]) < maximum_steps:
         raise TrainingError(
             f"SFT schedule ended at {state['optimizer_step']} before max_steps={maximum_steps}"
         )
+    seen_by_rank = distributed_objects(torch, (seen_positive, seen_negative), context)
+    seen_positive = any(bool(value[0]) for value in seen_by_rank)
+    seen_negative = any(bool(value[1]) for value in seen_by_rank)
     if not seen_positive or not seen_negative:
         raise TrainingError("This SFT run did not consume both positive and negative examples")
     final_peft = config.work_dir / "final-peft"
     if final_peft.exists():
         raise TrainingError(f"Final PEFT output already exists: {final_peft}")
-    model.save_pretrained(final_peft, safe_serialization=True)
+    final_model = accelerator.unwrap_model(model) if accelerator is not None else model
+    if context.is_main:
+        final_model.save_pretrained(final_peft, safe_serialization=True)
+    distributed_barrier(torch, context)
     memory_points.append(_memory(torch, device, "adapter_saved"))
-    peak_before_reload = max(float(point["peak_reserved_gib"]) for point in memory_points)
+    local_peak_before_reload = max(
+        float(point["peak_reserved_gib"]) for point in memory_points
+    )
+    rank_peaks = distributed_objects(torch, local_peak_before_reload, context)
+    peak_before_reload = max(float(value) for value in rank_peaks)
     if peak_before_reload > MEMORY_GATE_GIB:
         raise TrainingError(
             f"SFT peak reserved {peak_before_reload:.3f} GiB exceeds {MEMORY_GATE_GIB:.1f} GiB"
         )
 
-    del optimizer, scheduler, model
+    del optimizer, scheduler, model, final_model
     gc.collect()
     torch.cuda.empty_cache()
     memory_points.append(_memory(torch, device, "training_model_released"))
+    if not context.is_main:
+        distributed_barrier(torch, context)
+        artifact = AdapterArtifact.load(config.artifact_dir)
+        lifecycle_path = config.work_dir / "lifecycle.json"
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        return SFTResult(
+            artifact,
+            int(lifecycle["optimizer_steps"]),
+            int(lifecycle["micro_steps"]),
+            float(lifecycle["final_loss"]),
+            float(lifecycle["peak_reserved_gib"]),
+            str(lifecycle["positive_completion"]),
+            str(lifecycle["negative_completion"]),
+            lifecycle_path,
+        )
     candidate = config.artifact_dir.parent / f".{config.artifact_dir.name}.candidate"
     artifact_config = ArtifactInitConfig(
         1,
@@ -552,6 +702,8 @@ def run_sft(
             "final_loss": final_loss,
             "peak_reserved_gib_before_reload": peak_before_reload,
             "trainable_parameters": trainable,
+            "excluded_overlength_records": excluded_overlength_records,
+            "padded_record_ids": padded_record_ids,
         },
     )
 
@@ -598,11 +750,27 @@ def run_sft(
         "peak_reserved_gib": peak_reserved,
         "memory_gate_gib": MEMORY_GATE_GIB,
         "memory": memory_points,
+        "world_size": context.world_size,
+        "rank_peak_reserved_gib_before_reload": rank_peaks,
+        "excluded_overlength_records": excluded_overlength_records,
+        "padded_record_ids": padded_record_ids,
+        "rank_schedule_lengths_before_padding": schedule_lengths,
     }
     lifecycle_path = config.work_dir / "lifecycle.json"
     lifecycle_path.write_text(
         json.dumps(lifecycle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    from conceptdet.acceptance import emit_hardware_gate_report
+
+    emit_hardware_gate_report(
+        gate="H1" if context.world_size == 1 else "D1",
+        lifecycle_path=lifecycle_path,
+        artifact_path=artifact.path,
+        config_hash=config.config_hash,
+        dataset_fingerprint=dataset.fingerprint,
+        offline=config.runtime.local_files_only,
+    )
+    distributed_barrier(torch, context)
     return SFTResult(
         artifact,
         int(state["optimizer_step"]),

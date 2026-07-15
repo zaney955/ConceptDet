@@ -18,3 +18,4 @@ optimization:
   weight_decay: 0.01
   warmup_steps: 0
   seed: 23
+  checkpoint_steps: 100

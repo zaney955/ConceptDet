@@ -1,4 +1,4 @@
-.PHONY: env install run data train-sft train-grpo evaluate verify-env test lint check
+.PHONY: env install run data train-sft train-grpo evaluate accept-cpu accept-pr accept-release accept-distributed verify-env test lint check
 
 env:
 	bash scripts/create_env.sh
@@ -24,6 +24,15 @@ train-grpo:
 evaluate:
 	@test -n "$(CONFIG)" || (echo "Usage: make evaluate CONFIG=/path/to/evaluate.yaml" >&2; exit 2)
 	PYTHONPATH=src .venv/bin/python -m conceptdet evaluate --config "$(CONFIG)" --workers "$(or $(WORKERS),1)"
+
+accept-cpu:
+	@test -n "$(OUTPUT)" || (echo "Usage: make accept-cpu OUTPUT=/path/to/cpu_acceptance_report.json" >&2; exit 2)
+	PYTHONPATH=src .venv/bin/python -m conceptdet accept cpu --output "$(OUTPUT)"
+
+accept-pr accept-release accept-distributed:
+	@test -n "$(EVIDENCE)" || (echo "Usage: make $@ EVIDENCE=/path/to/evidence OUTPUT=/path/to/report.json" >&2; exit 2)
+	@test -n "$(OUTPUT)" || (echo "Usage: make $@ EVIDENCE=/path/to/evidence OUTPUT=/path/to/report.json" >&2; exit 2)
+	PYTHONPATH=src .venv/bin/python -m conceptdet accept assemble --profile "$(@:accept-%=%)" --evidence-dir "$(EVIDENCE)" --output "$(OUTPUT)"
 
 verify-env:
 	.venv/bin/python scripts/check_environment.py --require-cuda

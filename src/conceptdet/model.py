@@ -10,6 +10,7 @@ from conceptdet.adapter import AdapterGeneration, AdapterInput
 from conceptdet.artifact import AdapterArtifact
 from conceptdet.config import RuntimeConfig
 from conceptdet.errors import InputError, ModelLoadError
+from conceptdet.peft_weights import load_exact_adapter_weights
 from conceptdet.prompts import build_messages
 
 MIN_PIXELS = 65_536
@@ -136,6 +137,7 @@ class Qwen3VLAdapter:
                 local_files_only=runtime.local_files_only,
             )
             model = PeftModel.from_pretrained(model, artifact.path, is_trainable=False)
+            load_exact_adapter_weights(model, artifact.path)
             model.eval()
             model.config.use_cache = True
             model.generation_config.do_sample = False

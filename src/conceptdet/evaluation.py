@@ -591,4 +591,8 @@ def evaluate(config: EvaluationConfig, *, workers: int = 1) -> EvaluationArtifac
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return EvaluationArtifact.load(config.output_dir)
+    frozen = EvaluationArtifact.load(config.output_dir)
+    from conceptdet.acceptance import emit_evaluation_acceptance
+
+    emit_evaluation_acceptance(output_dir=config.output_dir, report=frozen.report)
+    return frozen

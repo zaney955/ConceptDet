@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="conceptdet", description="Qwen3-VL reference-guided Detection Sets"
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.6.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.7.0")
     domains = parser.add_subparsers(dest="domain", required=True)
 
     infer = domains.add_parser("infer", help="Run reference-guided inference")
@@ -92,13 +92,28 @@ def build_parser() -> argparse.ArgumentParser:
     grpo.add_argument(
         "--resume",
         default="none",
-        help="none; auto/PATH are reserved until distributed resume certification",
+        help="none, auto, or an explicit complete checkpoint directory",
     )
     evaluate = domains.add_parser(
         "evaluate", help="Evaluate saved strict Detection Set predictions"
     )
     _config_argument(evaluate)
     evaluate.add_argument("--workers", type=int, default=1)
+
+    accept = domains.add_parser("accept", help="Run or assemble acceptance gates")
+    accept_commands = accept.add_subparsers(dest="operation", required=True)
+    cpu = accept_commands.add_parser("cpu", help="Run C0 and C1 CPU gates")
+    cpu.add_argument("--root", type=Path, default=Path.cwd())
+    cpu.add_argument("--output", type=Path, required=True)
+    assemble = accept_commands.add_parser(
+        "assemble", help="Assemble PR, release, or distributed gate evidence"
+    )
+    assemble.add_argument(
+        "--profile", choices=("pr", "release", "distributed"), required=True
+    )
+    assemble.add_argument("--root", type=Path, default=Path.cwd())
+    assemble.add_argument("--evidence-dir", type=Path, required=True)
+    assemble.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -294,6 +309,22 @@ def _run_batch(config: BatchConfig, adapter: Any) -> int:
 
 
 def _execute(args: argparse.Namespace) -> int:
+    if args.domain == "accept":
+        from conceptdet.acceptance import assemble_acceptance_report, run_cpu_gates
+
+        if args.operation == "cpu":
+            report = run_cpu_gates(args.root.resolve(), args.output.resolve())
+        else:
+            report = assemble_acceptance_report(
+                root=args.root.resolve(),
+                profile=args.profile,
+                evidence_dir=args.evidence_dir.resolve(),
+                output=args.output.resolve(),
+            )
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        print(json.dumps({"report": str(report), "accepted": payload["accepted"]}))
+        return 0 if payload["accepted"] else 1
+
     if args.domain == "artifact" and args.operation == "inspect":
         artifact = AdapterArtifact.load(args.artifact)
         payload = {
@@ -389,7 +420,10 @@ def _execute(args: argparse.Namespace) -> int:
                 "peak_reserved_gib": result.peak_reserved_gib,
                 "lifecycle_report": str(result.lifecycle_report),
             }
-        print(json.dumps(payload))
+        from conceptdet.run_state import ProcessContext
+
+        if ProcessContext.current().is_main:
+            print(json.dumps(payload))
         return 0
 
     if args.domain == "evaluate":

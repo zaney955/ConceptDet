@@ -194,6 +194,7 @@ class GRPOOptimizationConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 0
     seed: int = 23
+    checkpoint_steps: int = 100
 
 
 @dataclass(frozen=True)
@@ -447,6 +448,7 @@ def _grpo_optimization(value: object) -> GRPOOptimizationConfig:
             "weight_decay",
             "warmup_steps",
             "seed",
+            "checkpoint_steps",
         },
     )
     maximum = raw.get("max_steps")
@@ -472,6 +474,11 @@ def _grpo_optimization(value: object) -> GRPOOptimizationConfig:
         _number(raw.get("weight_decay", 0.01), "$.optimization.weight_decay"),
         _integer(raw.get("warmup_steps", 0), "$.optimization.warmup_steps"),
         _integer(raw.get("seed", 23), "$.optimization.seed"),
+        _integer(
+            raw.get("checkpoint_steps", 100),
+            "$.optimization.checkpoint_steps",
+            minimum=1,
+        ),
     )
 
 
