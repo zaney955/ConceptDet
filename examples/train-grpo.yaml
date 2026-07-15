@@ -1,0 +1,20 @@
+schema_version: 1
+kind: train.grpo
+dataset_dir: ../outputs/datasets/generalcomp-v1
+parent_artifact: ../outputs/sft/generalcomp-sft-artifact
+work_dir: ../outputs/grpo/generalcomp-work
+artifact_dir: ../outputs/grpo/generalcomp-artifact
+runtime:
+  device: cuda:0
+  dtype: bfloat16
+  attention: flash_attention_2
+  max_new_tokens: 192
+  local_files_only: true
+optimization:
+  epochs: 1
+  max_steps: null
+  learning_rate: 1.0e-5
+  gradient_accumulation_steps: 2
+  weight_decay: 0.01
+  warmup_steps: 0
+  seed: 23

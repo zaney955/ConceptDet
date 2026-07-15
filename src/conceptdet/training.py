@@ -25,7 +25,11 @@ from conceptdet.artifact import (
     initialize_artifact,
 )
 from conceptdet.config import ArtifactInitConfig, RequestConfig, SFTStageConfig
-from conceptdet.dataset import DatasetArtifact
+from conceptdet.dataset import (
+    DatasetArtifact,
+    detection_request,
+    validate_training_dataset,
+)
 from conceptdet.errors import DatasetError, TrainingError
 from conceptdet.model import (
     MAX_TOTAL_SEQUENCE_TOKENS,
@@ -36,7 +40,6 @@ from conceptdet.model import (
 )
 from conceptdet.prompts import build_messages
 from conceptdet.protocol import parse_detection_set, serialize_detection_set
-from conceptdet.types import Box
 
 EXPECTED_TARGET_MODULES = 260
 EXPECTED_TRAINABLE_PARAMETERS = 44_793_856
@@ -108,30 +111,6 @@ def _load_rgb(path: Path) -> Image.Image:
         raise DatasetError(f"Cannot read training image: {path}") from exc
 
 
-def _record_request(dataset: DatasetArtifact, record: dict[str, Any]) -> RequestConfig:
-    reference = record.get("reference")
-    target = record.get("target")
-    if not isinstance(reference, dict) or not isinstance(target, dict):
-        raise DatasetError(f"Training record has invalid images: {record.get('id')}")
-    try:
-        boxes = tuple(Box.from_sequence(item) for item in reference["boxes_xyxy"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise DatasetError(
-            f"Training record has invalid Reference Boxes: {record.get('id')}"
-        ) from exc
-    if not boxes:
-        raise DatasetError(f"Training record has no Reference Boxes: {record.get('id')}")
-    query = record.get("query")
-    if not isinstance(query, str) or not query.strip():
-        raise DatasetError(f"Training record has no query: {record.get('id')}")
-    return RequestConfig(
-        dataset.resolve_image(reference),
-        boxes,
-        dataset.resolve_image(target),
-        query.strip(),
-    )
-
-
 class SFTBatchBuilder:
     """Deep internal module for model-visible SFT preprocessing and label masking."""
 
@@ -144,7 +123,7 @@ class SFTBatchBuilder:
             import torch
         except ImportError as exc:
             raise TrainingError("PyTorch is required for SFT batches") from exc
-        request = _record_request(self.dataset, record)
+        request = detection_request(self.dataset, record)
         reference, target = prepare_images(
             AdapterInput(
                 _load_rgb(request.reference_image),
@@ -250,36 +229,6 @@ def _schedule(records: list[dict[str, Any]], epochs: float, seed: int) -> list[d
     return scheduled
 
 
-def validate_sft_dataset(dataset: DatasetArtifact) -> dict[str, Any]:
-    records = list(dataset.iter_records("train"))
-    positive = sum(bool(row.get("positive")) for row in records)
-    negative = len(records) - positive
-    if not positive or not negative:
-        raise DatasetError("SFT dataset needs both positive and negative records")
-    groups = {
-        split: {str(row["group_id"]) for row in dataset.iter_records(split)}
-        for split in ("train", "validation", "test")
-    }
-    overlaps = {
-        f"{left}/{right}": sorted(groups[left] & groups[right])
-        for left, right in (("train", "validation"), ("train", "test"), ("validation", "test"))
-        if groups[left] & groups[right]
-    }
-    if overlaps:
-        raise DatasetError(f"Leakage groups cross dataset splits: {overlaps}")
-    for row in records[:8]:
-        _record_request(dataset, row)
-        parse_detection_set(
-            json.dumps(row["detection_set"], sort_keys=True, separators=(",", ":"))
-        )
-    return {
-        "dataset_fingerprint": dataset.fingerprint,
-        "records": len(records),
-        "positive": positive,
-        "negative": negative,
-    }
-
-
 def _memory(torch: Any, device: Any, checkpoint: str) -> dict[str, float | str]:
     torch.cuda.synchronize(device)
     free, total = torch.cuda.mem_get_info(device)
@@ -375,7 +324,7 @@ def _load_state(
 def _request_from_training_record(
     dataset: DatasetArtifact, record: dict[str, Any]
 ) -> RequestConfig:
-    return _record_request(dataset, record)
+    return dataset.detection_request(record)
 
 
 def run_sft(
@@ -407,7 +356,7 @@ def run_sft(
     torch.cuda.reset_peak_memory_stats(device)
 
     dataset = DatasetArtifact.load(config.dataset_dir)
-    validation = validate_sft_dataset(dataset)
+    validation = validate_training_dataset(dataset)
     records = list(dataset.iter_records("train"))
     schedule = _schedule(records, config.optimization.epochs, config.optimization.seed)
     if not schedule:

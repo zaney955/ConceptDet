@@ -13,9 +13,17 @@ from conceptdet.types import Box
 
 SCHEMA_VERSION = 1
 SUPPORTED_KINDS = frozenset(
-    {"infer.detect", "infer.batch", "artifact.init", "data.voc", "train.sft", "evaluate"}
+    {
+        "infer.detect",
+        "infer.batch",
+        "artifact.init",
+        "data.voc",
+        "train.sft",
+        "train.grpo",
+        "evaluate",
+    }
 )
-RESERVED_KINDS = frozenset({"train.grpo"})
+RESERVED_KINDS: frozenset[str] = frozenset()
 LEGACY_KEYS = frozenset(
     {
         "model_path",
@@ -178,6 +186,31 @@ class SFTStageConfig:
 
 
 @dataclass(frozen=True)
+class GRPOOptimizationConfig:
+    epochs: float = 1.0
+    max_steps: int | None = None
+    learning_rate: float = 1e-5
+    gradient_accumulation_steps: int = 2
+    weight_decay: float = 0.01
+    warmup_steps: int = 0
+    seed: int = 23
+
+
+@dataclass(frozen=True)
+class GRPOStageConfig:
+    schema_version: int
+    kind: Literal["train.grpo"]
+    dataset_dir: Path
+    parent_artifact: Path
+    work_dir: Path
+    artifact_dir: Path
+    runtime: RuntimeConfig
+    optimization: GRPOOptimizationConfig
+    config_path: Path
+    config_hash: str
+
+
+@dataclass(frozen=True)
 class EvaluationConfig:
     schema_version: int
     kind: Literal["evaluate"]
@@ -196,6 +229,7 @@ ConceptDetConfig: TypeAlias = (  # noqa: UP040 - package supports Python 3.10
     | ArtifactInitConfig
     | DataVocConfig
     | SFTStageConfig
+    | GRPOStageConfig
     | EvaluationConfig
 )
 
@@ -398,6 +432,46 @@ def _optimization(value: object) -> OptimizationConfig:
             minimum=1,
         ),
         _integer(raw.get("seed", 17), "$.optimization.seed"),
+    )
+
+
+def _grpo_optimization(value: object) -> GRPOOptimizationConfig:
+    raw = _mapping(
+        value or {},
+        "$.optimization",
+        allowed={
+            "epochs",
+            "max_steps",
+            "learning_rate",
+            "gradient_accumulation_steps",
+            "weight_decay",
+            "warmup_steps",
+            "seed",
+        },
+    )
+    maximum = raw.get("max_steps")
+    if maximum is not None:
+        maximum = _integer(maximum, "$.optimization.max_steps", minimum=1)
+    epochs = _number(raw.get("epochs", 1.0), "$.optimization.epochs")
+    learning_rate = _number(
+        raw.get("learning_rate", 1e-5), "$.optimization.learning_rate"
+    )
+    if epochs <= 0:
+        raise ConfigurationError("$.optimization.epochs must be > 0")
+    if learning_rate <= 0:
+        raise ConfigurationError("$.optimization.learning_rate must be > 0")
+    return GRPOOptimizationConfig(
+        epochs,
+        maximum,
+        learning_rate,
+        _integer(
+            raw.get("gradient_accumulation_steps", 2),
+            "$.optimization.gradient_accumulation_steps",
+            minimum=1,
+        ),
+        _number(raw.get("weight_decay", 0.01), "$.optimization.weight_decay"),
+        _integer(raw.get("warmup_steps", 0), "$.optimization.warmup_steps"),
+        _integer(raw.get("seed", 23), "$.optimization.seed"),
     )
 
 
@@ -629,6 +703,49 @@ def load_config(path: str | Path) -> ConceptDetConfig:
             )
         )
 
+    if kind == "train.grpo":
+        _mapping(
+            root,
+            "$",
+            allowed={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "parent_artifact",
+                "work_dir",
+                "artifact_dir",
+                "runtime",
+                "optimization",
+            },
+            required={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "parent_artifact",
+                "work_dir",
+                "artifact_dir",
+            },
+        )
+        runtime = _runtime(root.get("runtime"))
+        if runtime.max_new_tokens != 192:
+            raise ConfigurationError(
+                "$.runtime.max_new_tokens must be exactly 192 for native GRPO"
+            )
+        return _finalize_hash(
+            GRPOStageConfig(
+                1,
+                "train.grpo",
+                _path(root["dataset_dir"], "$.dataset_dir", base),
+                _path(root["parent_artifact"], "$.parent_artifact", base),
+                _path(root["work_dir"], "$.work_dir", base),
+                _path(root["artifact_dir"], "$.artifact_dir", base),
+                runtime,
+                _grpo_optimization(root.get("optimization")),
+                config_path,
+                "",
+            )
+        )
+
     if kind == "evaluate":
         _mapping(
             root,
@@ -755,6 +872,18 @@ def config_to_dict(config: ConceptDetConfig) -> dict[str, Any]:
             "schema_version": 1,
             "kind": config.kind,
             "dataset_dir": str(config.dataset_dir),
+            "work_dir": str(config.work_dir),
+            "artifact_dir": str(config.artifact_dir),
+            "runtime": config.runtime.__dict__,
+            "optimization": config.optimization.__dict__,
+            "config_hash": config.config_hash,
+        }
+    if isinstance(config, GRPOStageConfig):
+        return {
+            "schema_version": 1,
+            "kind": config.kind,
+            "dataset_dir": str(config.dataset_dir),
+            "parent_artifact": str(config.parent_artifact),
             "work_dir": str(config.work_dir),
             "artifact_dir": str(config.artifact_dir),
             "runtime": config.runtime.__dict__,

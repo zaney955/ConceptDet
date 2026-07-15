@@ -7,6 +7,7 @@ from conceptdet.config import (
     DataVocConfig,
     DetectConfig,
     EvaluationConfig,
+    GRPOStageConfig,
     SFTStageConfig,
     config_to_dict,
     load_config,
@@ -74,11 +75,25 @@ def test_config_rejects_duplicates_unknown_and_legacy_fields(tmp_path: Path) -> 
         load_config(_write(tmp_path / "legacy.yaml", _detect_yaml("input_size: 600")))
 
 
-def test_reserved_training_kind_has_targeted_error(tmp_path: Path) -> None:
-    with pytest.raises(ConfigurationError, match="not implemented"):
-        load_config(
-            _write(tmp_path / "grpo.yaml", "schema_version: 1\nkind: train.grpo\n")
-        )
+def test_grpo_config_freezes_native_generation_contract(tmp_path: Path) -> None:
+    body = """
+schema_version: 1
+kind: train.grpo
+dataset_dir: compiled
+parent_artifact: sft-artifact
+work_dir: grpo-work
+artifact_dir: grpo-artifact
+runtime: {device: cuda:0, max_new_tokens: 192, local_files_only: true}
+optimization: {max_steps: 2, gradient_accumulation_steps: 2}
+"""
+    config = load_config(_write(tmp_path / "grpo.yaml", body))
+    assert isinstance(config, GRPOStageConfig)
+    assert config.parent_artifact == (tmp_path / "sft-artifact").resolve()
+    assert config.optimization.learning_rate == 1e-5
+    assert config.runtime.max_new_tokens == 192
+
+    with pytest.raises(ConfigurationError, match="exactly 192"):
+        load_config(_write(tmp_path / "grpo-short.yaml", body.replace("192", "128")))
 
 
 def test_artifact_init_requires_grpo_parent(tmp_path: Path) -> None:

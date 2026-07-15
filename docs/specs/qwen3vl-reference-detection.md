@@ -31,7 +31,7 @@ CLI Application
   ├── Artifact Module
   ├── SFT Stage Module
   ├── Evaluation Module
-  └── GRPO Stage Module            (next slice)
+  └── GRPO Stage Module
 ```
 
 The external inference seam is a single `DetectionApplication.detect(request)`
@@ -59,7 +59,6 @@ conceptdet artifact inspect ARTIFACT [--json]
 conceptdet data voc --config FILE
 conceptdet train sft --config FILE [--resume none|auto|PATH]
 
-# specified now, implemented in later slices
 conceptdet train grpo --config FILE [--resume none|auto|PATH]
 conceptdet evaluate --config FILE
 ```
@@ -88,10 +87,8 @@ Implemented v1 kinds:
 - `artifact.init`
 - `data.voc`
 - `train.sft`
+- `train.grpo`
 - `evaluate`
-
-Reserved kind `train.grpo` fails with a targeted
-“not implemented by this release” error until its slice lands.
 
 The Data Module treats VOC XML as the authoritative record set, validates image
 size and bbox semantics, retains all instances of the selected Visual Concept,
@@ -112,6 +109,16 @@ Artifact, and complete prediction JSONL containing `id` and the saved
 atomically publishes a fingerprinted `report.json` plus sorted per-record JSONL,
 and fails on missing, duplicate, or extra prediction identities. Prediction row
 order and the operational worker count cannot change report bytes.
+
+The GRPO Stage Module initializes the exact LoRA weights from an immutable SFT
+Artifact without inheriting optimizer state. It lazily emits raw conversations,
+ordered images, normalized truth, and record metadata to stock TRL 1.5
+`GRPOTrainer`. Native generation is fixed to `beta=0`, no reference model, two
+generations, and 192 completion tokens. Reward is 10% strict format plus 90%
+soft Set-F1 from the Evaluation Module. Publication requires a nonzero-advantage
+group, changed adapter parameters, exact SFT lineage, strict save/reload
+generation, and the 44 GiB lifecycle gate. Resume modes other than `none` remain
+reserved for the distributed/resume certification slice.
 
 Example detection config:
 

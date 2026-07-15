@@ -17,9 +17,9 @@ from typing import Any
 
 from PIL import Image
 
-from conceptdet.config import DataVocConfig, SplitConfig, VocSourceConfig
+from conceptdet.config import DataVocConfig, RequestConfig, SplitConfig, VocSourceConfig
 from conceptdet.errors import DatasetError
-from conceptdet.protocol import ProtocolDetection, encode_pixel_box
+from conceptdet.protocol import ProtocolDetection, encode_pixel_box, parse_detection_set
 from conceptdet.types import Box
 
 DATASET_FILE = "dataset.json"
@@ -526,6 +526,67 @@ class DatasetArtifact:
         if not path.is_file():
             raise DatasetError(f"Dataset image no longer exists: {path}")
         return path
+
+    def detection_request(self, record: dict[str, Any]) -> RequestConfig:
+        return detection_request(self, record)
+
+
+def detection_request(dataset: DatasetArtifact, record: dict[str, Any]) -> RequestConfig:
+    reference = record.get("reference")
+    target = record.get("target")
+    if not isinstance(reference, dict) or not isinstance(target, dict):
+        raise DatasetError(f"Dataset record has invalid images: {record.get('id')}")
+    try:
+        boxes = tuple(Box.from_sequence(item) for item in reference["boxes_xyxy"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatasetError(
+            f"Dataset record has invalid Reference Boxes: {record.get('id')}"
+        ) from exc
+    if not boxes:
+        raise DatasetError(f"Dataset record has no Reference Boxes: {record.get('id')}")
+    query = record.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise DatasetError(f"Dataset record has no query: {record.get('id')}")
+    return RequestConfig(
+        dataset.resolve_image(reference),
+        boxes,
+        dataset.resolve_image(target),
+        query.strip(),
+    )
+
+
+def validate_training_dataset(dataset: DatasetArtifact) -> dict[str, Any]:
+    records = list(dataset.iter_records("train"))
+    positive = sum(bool(row.get("positive")) for row in records)
+    negative = len(records) - positive
+    if not positive or not negative:
+        raise DatasetError("Training dataset needs both positive and negative records")
+    groups = {
+        split: {str(row["group_id"]) for row in dataset.iter_records(split)}
+        for split in SPLITS
+    }
+    overlaps = {
+        f"{left}/{right}": sorted(groups[left] & groups[right])
+        for left, right in (
+            ("train", "validation"),
+            ("train", "test"),
+            ("validation", "test"),
+        )
+        if groups[left] & groups[right]
+    }
+    if overlaps:
+        raise DatasetError(f"Leakage groups cross dataset splits: {overlaps}")
+    for row in records[:8]:
+        dataset.detection_request(row)
+        parse_detection_set(
+            json.dumps(row["detection_set"], sort_keys=True, separators=(",", ":"))
+        )
+    return {
+        "dataset_fingerprint": dataset.fingerprint,
+        "records": len(records),
+        "positive": positive,
+        "negative": negative,
+    }
 
 
 def compile_voc_dataset(config: DataVocConfig) -> DatasetArtifact:

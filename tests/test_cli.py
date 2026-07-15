@@ -16,6 +16,8 @@ from conceptdet.config import (
     ArtifactInitConfig,
     DataVocConfig,
     EvaluationConfig,
+    GRPOOptimizationConfig,
+    GRPOStageConfig,
     OptimizationConfig,
     RuntimeConfig,
     SFTStageConfig,
@@ -295,3 +297,54 @@ def test_evaluate_cli_forwards_worker_count(tmp_path: Path, monkeypatch, capsys)
     assert json.loads(capsys.readouterr().out)["evaluation_fingerprint"] == (
         "evaluation-hash"
     )
+
+
+def test_train_grpo_cli_uses_separate_stage_and_forwards_resume(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    import conceptdet.grpo as grpo
+
+    config = GRPOStageConfig(
+        1,
+        "train.grpo",
+        tmp_path / "dataset",
+        tmp_path / "sft-artifact",
+        tmp_path / "work",
+        tmp_path / "grpo-artifact",
+        RuntimeConfig(max_new_tokens=192),
+        GRPOOptimizationConfig(max_steps=2),
+        tmp_path / "grpo.yaml",
+        "config-hash",
+    )
+    received: list[object] = []
+
+    def fake_run(_: object, *, resume: object) -> SimpleNamespace:
+        received.append(resume)
+        return SimpleNamespace(
+            artifact=SimpleNamespace(path=config.artifact_dir, fingerprint="grpo-hash"),
+            optimizer_steps=2,
+            reward_events=4,
+            nonzero_advantage_groups=1,
+            peak_reserved_gib=19.0,
+            lifecycle_report=config.work_dir / "lifecycle.json",
+        )
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(grpo, "run_grpo", fake_run)
+    assert (
+        cli.main(
+            [
+                "train",
+                "grpo",
+                "--config",
+                str(config.config_path),
+                "--resume",
+                "none",
+            ]
+        )
+        == 0
+    )
+    assert received == ["none"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["artifact_fingerprint"] == "grpo-hash"
+    assert payload["nonzero_advantage_groups"] == 1

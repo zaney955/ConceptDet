@@ -94,6 +94,36 @@ enforces the 44 GiB peak-reserved gate. A short lifecycle run proves mechanics;
 it is not a quality-trained model. Use `max_steps: null` for the configured full
 epoch schedule.
 
+## Native bbox GRPO
+
+GRPO starts from an immutable SFT Artifact, never from an SFT run checkpoint,
+and therefore inherits adapter weights without optimizer, scheduler, or RNG
+state. Install the optional profile and copy
+[examples/train-grpo.yaml](examples/train-grpo.yaml):
+
+```bash
+.venv/bin/python -m pip install -e '.[grpo]'
+.venv/bin/python -m conceptdet config validate --config /tmp/train-grpo.yaml
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m conceptdet train grpo \
+  --config /tmp/train-grpo.yaml --resume none
+```
+
+The stage uses the stock TRL 1.5 `GRPOTrainer` and native Transformers
+generation: `beta=0`, no reference model, no vLLM, exactly two generations,
+and a 192-token completion budget. The Dataset Module lazily emits a raw
+conversation, ordered `[Reference Image, Target Image]`, and normalized truth;
+the same Qwen processor owns tokenization and forward recomputation. Every
+record must satisfy prompt + 192 ≤ 1,536; truncation remains forbidden.
+
+Reward is exactly 10% strict Detection Set format plus 90% soft Set-F1 from the
+Evaluation Module. Invalid JSON receives zero; duplicate boxes, misses, and
+false positives reduce soft Set-F1; correct empty/empty receives 1.0. A run is
+published only if the callback sees positive and negative groups, at least one
+group has nonzero advantage, LoRA parameters change, save/release/reload strict
+generation succeeds, parent lineage is exact, and peak reserved memory remains
+at most 44 GiB. `max_steps: null` selects the configured full epoch. GRPO resume
+other than `none` remains fail-closed until #21 completes resume certification.
+
 ## Wrap a PEFT adapter as an Artifact
 
 ConceptDet validates the complete inference contract before allocating the 8B

@@ -21,6 +21,7 @@ from conceptdet.config import (
     DataVocConfig,
     DetectConfig,
     EvaluationConfig,
+    GRPOStageConfig,
     OutputConfig,
     RequestConfig,
     SFTStageConfig,
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="conceptdet", description="Qwen3-VL reference-guided Detection Sets"
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.5.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.6.0")
     domains = parser.add_subparsers(dest="domain", required=True)
 
     infer = domains.add_parser("infer", help="Run reference-guided inference")
@@ -84,6 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="none, auto, or an explicit checkpoint directory",
     )
+    grpo = train_commands.add_parser(
+        "grpo", help="Run native Qwen3-VL LoRA GRPO from an SFT Artifact"
+    )
+    _config_argument(grpo)
+    grpo.add_argument(
+        "--resume",
+        default="none",
+        help="none; auto/PATH are reserved until distributed resume certification",
+    )
     evaluate = domains.add_parser(
         "evaluate", help="Evaluate saved strict Detection Set predictions"
     )
@@ -103,6 +113,7 @@ def _validate_resources(
         | ArtifactInitConfig
         | DataVocConfig
         | SFTStageConfig
+        | GRPOStageConfig
         | EvaluationConfig
     ),
 ) -> None:
@@ -143,12 +154,16 @@ def _validate_resources(
                 f"Compiled dataset output already exists: {config.output_dir}"
             )
     elif isinstance(config, SFTStageConfig):
-        from conceptdet.training import validate_sft_dataset
-
         dataset = DatasetArtifact.load(config.dataset_dir)
-        validate_sft_dataset(dataset)
+        from conceptdet.dataset import validate_training_dataset
+
+        validate_training_dataset(dataset)
         if config.artifact_dir.exists():
             raise ArtifactError(f"SFT Artifact output already exists: {config.artifact_dir}")
+    elif isinstance(config, GRPOStageConfig):
+        from conceptdet.grpo import validate_grpo_inputs
+
+        validate_grpo_inputs(config)
     else:
         from conceptdet.evaluation import EvaluationArtifact
 
@@ -341,27 +356,40 @@ def _execute(args: argparse.Namespace) -> int:
         return 0
 
     if args.domain == "train":
-        if not isinstance(config, SFTStageConfig):
-            raise ConfigurationError("train sft requires kind: train.sft")
-        from conceptdet.training import run_sft
-
         resume: str | Path = args.resume
         if resume not in {"none", "auto"}:
             resume = Path(resume)
-        result = run_sft(config, resume=resume)  # type: ignore[arg-type]
-        print(
-            json.dumps(
-                {
-                    "artifact": str(result.artifact.path),
-                    "artifact_fingerprint": result.artifact.fingerprint,
-                    "optimizer_steps": result.optimizer_steps,
-                    "micro_steps": result.micro_steps,
-                    "final_loss": result.final_loss,
-                    "peak_reserved_gib": result.peak_reserved_gib,
-                    "lifecycle_report": str(result.lifecycle_report),
-                }
-            )
-        )
+        if args.operation == "sft":
+            if not isinstance(config, SFTStageConfig):
+                raise ConfigurationError("train sft requires kind: train.sft")
+            from conceptdet.training import run_sft
+
+            result = run_sft(config, resume=resume)  # type: ignore[arg-type]
+            payload = {
+                "artifact": str(result.artifact.path),
+                "artifact_fingerprint": result.artifact.fingerprint,
+                "optimizer_steps": result.optimizer_steps,
+                "micro_steps": result.micro_steps,
+                "final_loss": result.final_loss,
+                "peak_reserved_gib": result.peak_reserved_gib,
+                "lifecycle_report": str(result.lifecycle_report),
+            }
+        else:
+            if not isinstance(config, GRPOStageConfig):
+                raise ConfigurationError("train grpo requires kind: train.grpo")
+            from conceptdet.grpo import run_grpo
+
+            result = run_grpo(config, resume=resume)  # type: ignore[arg-type]
+            payload = {
+                "artifact": str(result.artifact.path),
+                "artifact_fingerprint": result.artifact.fingerprint,
+                "optimizer_steps": result.optimizer_steps,
+                "reward_events": result.reward_events,
+                "nonzero_advantage_groups": result.nonzero_advantage_groups,
+                "peak_reserved_gib": result.peak_reserved_gib,
+                "lifecycle_report": str(result.lifecycle_report),
+            }
+        print(json.dumps(payload))
         return 0
 
     if args.domain == "evaluate":

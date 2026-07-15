@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conceptdet-r1"
-version = "0.5.0"
+version = "0.6.0"
 description = "Qwen3-VL reference-guided multi-instance detection"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,7 +31,7 @@ train = [
 grpo = [
   "datasets>=5.0.0,<6",
   "peft>=0.19.1,<0.20",
-  "trl>=1.5.0,<1.6",
+  "trl==1.5.0",
 ]
 distributed = ["deepspeed>=0.18,<0.19"]
 dev = [

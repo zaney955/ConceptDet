@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import combinations
@@ -101,6 +102,40 @@ class _Example:
     target_width: int
     target_height: int
     raw_completion: str
+
+
+@dataclass(frozen=True)
+class DetectionReward:
+    format_valid: bool
+    format_error: str | None
+    soft_set_f1: float
+    format_reward: float
+    quality_reward: float
+    total_reward: float
+
+
+def score_detection_reward(raw_completion: str, targets: Sequence[Box]) -> DetectionReward:
+    """Score one GRPO completion with the frozen 10% format / 90% quality rule."""
+    try:
+        predictions = tuple(
+            sorted(
+                (item.box for item in parse_detection_set(raw_completion)),
+                key=_box_key,
+            )
+        )
+    except OutputFormatError as exc:
+        return DetectionReward(False, str(exc), 0.0, 0.0, 0.0, 0.0)
+    soft_set_f1 = _soft_set_f1(predictions, tuple(targets))
+    format_reward = 0.10
+    quality_reward = 0.90 * soft_set_f1
+    return DetectionReward(
+        True,
+        None,
+        soft_set_f1,
+        format_reward,
+        quality_reward,
+        format_reward + quality_reward,
+    )
 
 
 @dataclass(frozen=True)

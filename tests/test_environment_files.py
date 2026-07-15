@@ -21,3 +21,8 @@ def test_environment_scripts_never_reference_conceptseg_runtime() -> None:
     for name in ("create_env.sh", "run_inference.sh", "check_environment.py"):
         content = (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8")
         assert "ConceptSeg-R1/.venv" not in content
+
+
+def test_grpo_optional_profile_pins_validated_stock_trl() -> None:
+    project = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"trl==1.5.0"' in project
