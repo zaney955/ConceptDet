@@ -1,0 +1,47 @@
+{
+  "model_revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 4090",
+    "uuid": "f5d26a68-6bc0-f825-dbf9-9c226543b382",
+    "capacity_gib": 47.37115478515625
+  },
+  "input": {
+    "processed_size": [832, 736],
+    "visual_tokens_per_image": 598,
+    "visual_tokens_per_image_cap": 640,
+    "positive_sequence_tokens": 1348,
+    "negative_sequence_tokens": 1303
+  },
+  "full": {
+    "target_module_count": 260,
+    "target_modules_sha256": "fdff350e33d483666eb85ead6d1dc062df8739f2f6d78dc20663bf49fa755402",
+    "trainable_parameters": 44793856,
+    "adapter_bytes": 179252976,
+    "peak_reserved_gib": 21.193359375,
+    "peak_device_used_gib": 21.680419921875,
+    "mean_loss_before": 0.5724020997675439,
+    "mean_loss_after": 0.47281461954094084,
+    "strict_generation": [{"bbox_2d": [750, 607, 775, 670]}, {"bbox_2d": [216, 607, 241, 670]}],
+    "accepted": true
+  },
+  "attention": {
+    "target_module_count": 152,
+    "target_modules_sha256": "533ba062bf50b253778772821dd7ef11f2d1d166a188b02814bb98c101726a35",
+    "trainable_parameters": 16482304,
+    "adapter_bytes": 65974608,
+    "peak_reserved_gib": 20.572265625,
+    "peak_device_used_gib": 21.059326171875,
+    "mean_loss_before": 0.5724020997675439,
+    "mean_loss_after": 0.5097753802927514,
+    "strict_generation": [{"bbox_2d": [218, 593, 250, 648]}, {"bbox_2d": [750, 593, 782, 648]}],
+    "accepted": true
+  },
+  "delta_full_minus_attention": {
+    "trainable_parameters": 28311552,
+    "adapter_bytes": 113278368,
+    "peak_reserved_gib": 0.62109375,
+    "mean_loss_improvement": 0.03696076075181054
+  },
+  "memory_gate_gib": 44.0,
+  "verdict": "keep text-all + multimodal-mergers rank 16 as default; retain attention-only as a quality ablation"
+}
