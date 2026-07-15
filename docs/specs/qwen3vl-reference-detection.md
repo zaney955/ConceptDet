@@ -184,6 +184,11 @@ revisions, ordered image roles, resize/rendering/prompt/output schemas, sequence
 limits, and LoRA topology. `contract_fingerprint` is SHA-256 over canonical JSON
 excluding the fingerprint field.
 
+`training_summary.json` stores an `artifact_fingerprint` over the contract
+fingerprint, adapter/config file hashes, stage, parent fingerprint, and init
+provenance. This distinguishes trained adapters that implement the same
+contract and makes SFT→GRPO lineage tamper-evident.
+
 The default LoRA topology is rank 16, alpha 32, dropout 0.05, bias none,
 text-all plus multimodal mergers, 260 target modules, target-list hash
 `fdff350e33d483666eb85ead6d1dc062df8739f2f6d78dc20663bf49fa755402`,

@@ -1,28 +1,24 @@
 import pytest
 
 from conceptdet.errors import InputError
-from conceptdet.types import Box, parse_boxes
+from conceptdet.types import Box
 
 
-def test_parse_boxes_accepts_semicolon_and_whitespace() -> None:
-    boxes = parse_boxes("1, 2, 11, 12; 20 30 40 50")
-    assert boxes == (Box(1, 2, 11, 12), Box(20, 30, 40, 50))
+def test_box_accepts_numeric_xyxy_and_exposes_area() -> None:
+    box = Box.from_sequence([1, 2.5, 11, 12.5])
+    assert box == Box(1, 2.5, 11, 12.5)
+    assert box.area == 100
 
 
-def test_parse_boxes_accepts_single_and_nested_sequences() -> None:
-    assert parse_boxes([1, 2, 3, 4]) == (Box(1, 2, 3, 4),)
-    assert parse_boxes([[1, 2, 3, 4], [5, 6, 7, 8]]) == (
-        Box(1, 2, 3, 4),
-        Box(5, 6, 7, 8),
-    )
-
-
-@pytest.mark.parametrize("value", ["", "1,2,3", "1,2,1,4", [[1, 2, 3]]])
-def test_parse_boxes_rejects_invalid_input(value: object) -> None:
-    with pytest.raises(InputError):
-        parse_boxes(value)  # type: ignore[arg-type]
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [([True, 2, 3, 4], "must be numeric"), (["1", 2, 3, 4], "must be numeric"), (7, "sequence")],
+)
+def test_box_rejects_non_numeric_yaml_values(values: object, message: str) -> None:
+    with pytest.raises(InputError, match=message):
+        Box.from_sequence(values)  # type: ignore[arg-type]
 
 
 def test_box_clamp_rejects_fully_outside_box() -> None:
-    with pytest.raises(InputError):
+    with pytest.raises(InputError, match="outside image"):
         Box(20, 20, 30, 30).clamp(10, 10)

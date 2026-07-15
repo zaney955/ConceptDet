@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import math
-import re
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Iterable, Sequence
 
 from conceptdet.errors import InputError
 
@@ -26,12 +25,13 @@ class Box:
 
     @classmethod
     def from_sequence(cls, values: Sequence[float]) -> Box:
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            raise InputError(f"Bounding box must be a four-value sequence: {values}")
         if len(values) != 4:
             raise InputError(f"Expected four bbox values, got {len(values)}: {values}")
-        try:
-            return cls(*(float(value) for value in values))
-        except (TypeError, ValueError) as exc:
-            raise InputError(f"Bounding box values must be numeric: {values}") from exc
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            raise InputError(f"Bounding box values must be numeric: {values}")
+        return cls(*(float(value) for value in values))
 
     def shifted(self, dx: float, dy: float) -> Box:
         return Box(self.x1 + dx, self.y1 + dy, self.x2 + dx, self.y2 + dy)
@@ -61,23 +61,6 @@ class Box:
         values = [self.x1, self.y1, self.x2, self.y2]
         return [int(round(value)) for value in values] if rounded else values
 
-
-def parse_boxes(value: str | Iterable[Sequence[float]] | Sequence[float]) -> tuple[Box, ...]:
-    """Parse ``x1,y1,x2,y2;x1,y1,x2,y2`` or an equivalent sequence."""
-
-    if isinstance(value, str):
-        groups = [part.strip() for part in value.split(";") if part.strip()]
-        if not groups:
-            raise InputError("At least one reference box is required")
-        boxes = []
-        for group in groups:
-            tokens = [token for token in re.split(r"[\s,]+", group) if token]
-            boxes.append(Box.from_sequence(tokens))
-        return tuple(boxes)
-
-    materialized = list(value)
-    if not materialized:
-        raise InputError("At least one reference box is required")
-    if len(materialized) == 4 and all(isinstance(item, (int, float)) for item in materialized):
-        return (Box.from_sequence(materialized),)
-    return tuple(Box.from_sequence(item) for item in materialized)
+    @property
+    def area(self) -> float:
+        return (self.x2 - self.x1) * (self.y2 - self.y1)

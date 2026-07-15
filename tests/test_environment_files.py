@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).parents[1]
 
 
@@ -12,7 +11,9 @@ def test_runtime_versions_are_locked_to_modern_stack() -> None:
     assert "torchvision==0.28.0" in requirements
     assert "transformers==5.13.1" in requirements
     assert "accelerate==1.14.0" in requirements
+    assert "peft==0.19.1" in requirements
     assert "pillow==12.3.0" in requirements
+    assert "pyyaml==6.0.3" in requirements
     assert "sentencepiece==0.2.2" in requirements
 
 

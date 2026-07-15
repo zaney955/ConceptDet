@@ -12,3 +12,11 @@ class ModelLoadError(ConceptDetError):
 
 class OutputFormatError(ConceptDetError):
     """Raised when model output does not contain a usable bounding box."""
+
+
+class ConfigurationError(ConceptDetError):
+    """Raised when a versioned ConceptDet YAML document is invalid."""
+
+
+class ArtifactError(ConceptDetError):
+    """Raised when an Adapter Artifact is missing, mutable, or incompatible."""
