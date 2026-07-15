@@ -1,0 +1,258 @@
+# Qwen3-VL Reference-Guided Detection Engineering Specification
+
+Status: implementation-ready  
+Decision source: [Wayfinder #1](https://github.com/zaney955/ConceptDet/issues/1),
+with authoritative child decisions #2–#13.
+
+## 1. Goal and non-goals
+
+ConceptDet identifies every Target Instance in one Target Image that belongs to
+the Visual Concept demonstrated by one or more Reference Boxes in one Reference
+Image. Version 1 replaces the ConceptSeg/Qwen2.5 runtime with
+`Qwen/Qwen3-VL-8B-Instruct` and establishes the same model-visible contract for
+inference, bbox SFT, evaluation, and optional bbox GRPO.
+
+Version 1 does not preserve old checkpoints, prompts, fixed 600×600 inputs,
+SAM/mask losses, learnable queries, connectors, projections, custom Qwen model
+forks, or custom trainers. It does not claim that a smoke-trained adapter is a
+quality model.
+
+## 2. Architecture and seams
+
+```text
+CLI Application
+  ├── Config Module
+  ├── Detection Application
+  │     ├── Detection Protocol Module
+  │     └── Qwen Adapter seam
+  │           ├── Fake Adapter
+  │           └── Qwen3-VL Adapter
+  ├── Manifest/Data Module
+  ├── Artifact Module
+  ├── SFT Stage Module             (next slice)
+  ├── Evaluation Module            (next slice)
+  └── GRPO Stage Module            (next slice)
+```
+
+The external inference seam is a single `DetectionApplication.detect(request)`
+interface. It accepts source images, Reference Boxes, and query semantics; it
+returns a complete Detection Set plus prepared-input provenance. The Qwen
+Adapter owns model-visible preprocessing and generation. The Detection Protocol
+owns serialization and coordinate conversion. Neither the CLI nor tests call a
+Transformers processor directly.
+
+The Qwen Adapter seam is real: production uses Qwen3-VL while application tests
+use the deterministic Fake Adapter. Trainer seams remain private to their stage
+modules.
+
+## 3. Public CLI
+
+The stable command tree is:
+
+```text
+conceptdet infer detect --config FILE
+conceptdet infer batch --config FILE
+conceptdet config validate --config FILE
+conceptdet config render --config FILE [--output FILE]
+conceptdet artifact init --config FILE
+conceptdet artifact inspect ARTIFACT [--json]
+
+# specified now, implemented in later slices
+conceptdet train sft --config FILE [--resume none|auto|PATH]
+conceptdet train grpo --config FILE [--resume none|auto|PATH]
+conceptdet evaluate --config FILE
+```
+
+YAML is the only semantic configuration source. CLI overrides are limited to
+operational output, device, offline, dry-run, resume, and log level. There is no
+Python configuration module, generic `--set`, environment interpolation, or
+upstream trainer-kwargs escape hatch.
+
+Inference stdout contains only the strict JSON Detection Set. Diagnostics and
+paths use stderr. Configuration, compatibility, or input errors exit 2;
+execution errors exit 1; success exits 0.
+
+## 4. Strict configuration
+
+The Config Module parses safe YAML into a closed discriminated union. It rejects
+duplicate, unknown, missing, mistyped, merge-key, and command-incompatible
+fields before model allocation. Relative paths resolve against the YAML file.
+Every accepted configuration is expanded into a canonical resolved payload and
+SHA-256 hash.
+
+Implemented v1 kinds:
+
+- `infer.detect`
+- `infer.batch`
+- `artifact.init`
+
+Reserved kinds `train.sft`, `train.grpo`, and `evaluate` fail with a targeted
+“not implemented by this release” error until their slices land.
+
+Example detection config:
+
+```yaml
+schema_version: 1
+kind: infer.detect
+artifact: artifacts/sft-final
+request:
+  reference_image: images/reference.jpg
+  reference_boxes:
+    - [1165, 2911, 1354, 3230]
+  target_image: images/target.jpg
+  query: the same bolt as the boxed example
+output:
+  image: outputs/result.png
+  json: outputs/result.json
+  layout: annotated
+runtime:
+  device: cuda:0
+  dtype: bfloat16
+  attention: flash_attention_2
+  max_new_tokens: 192
+  local_files_only: true
+```
+
+Batch config replaces `request` with `manifest` and `output_dir`. Each JSONL row
+contains `id`, `reference_image`, `reference_boxes`, `target_image`, and `query`.
+
+Known obsolete keys (`model_path`, `input_size`, `max_pixels`, `packing`,
+`mask*`, `sam*`, `learnable_query`, `connector`, `projection`,
+`resume_from_checkpoint`, `use_vllm`, Qwen2.5/ConceptSeg model fields) receive a
+clean-break diagnostic rather than a generic unknown-field error.
+
+## 5. Detection Protocol
+
+Model output is exactly a bare JSON array:
+
+```json
+[{"bbox_2d":[x1,y1,x2,y2]}]
+```
+
+An optional string `label` is accepted but ignored by matching. Other keys,
+Markdown fences, prose, booleans, floats, out-of-range coordinates, and
+degenerate boxes are invalid. `[]` is the exact no-match result. Array order has
+no meaning.
+
+Coordinates are integer normalized 0–1000 XYXY. Original truth uses half-open
+pixel XYXY. Encoding uses nonnegative half-up rounding. Decoding scales
+continuous endpoints to the Target Image, clamps them to image bounds, and
+rejects degeneracy.
+
+Evaluation is confidence-free. The primary future metric is positive macro
+mean Set-F1 at IoU thresholds 0.50:0.05:0.95, not COCO mAP.
+
+## 6. Qwen3-VL Adapter contract
+
+The production Adapter loads:
+
+- model and processor: `Qwen/Qwen3-VL-8B-Instruct`;
+- immutable revision:
+  `0c351dd01ed87e9c1b53cbc748cba10e6187ff3b`;
+- one compatible PEFT Adapter Artifact;
+- BF16 by default, FlashAttention 2 on supported CUDA devices;
+- greedy generation for inference.
+
+Input roles are ordered `[Reference Image, Target Image]`. Both images are EXIF
+transposed, converted to RGB, and independently smart-resized with factor 32,
+64–640 merged visual tokens, and 65,536–655,360 pixels. The Adapter draws
+Reference Boxes after resize using:
+
+- inner color `#ff2020`;
+- inner width `clamp(round(shortest_side / 256), 2, 4)`;
+- outward white halo `#ffffff`, width 2.
+
+The Target Image remains undecorated. The processor receives already prepared
+images with resize disabled. The chat template uses vision IDs, Picture 1 for
+Reference and Picture 2 for Target, and explicitly forbids Markdown fences.
+Total prompt/response length is at most 1,536; inference and GRPO completion
+length is at most 192.
+
+## 7. Adapter Artifact
+
+An Artifact directory is immutable after publication and contains:
+
+```text
+adapter_model.safetensors
+adapter_config.json
+conceptdet_contract.json
+training_summary.json
+```
+
+`conceptdet_contract.json` records exact base/processor identities and
+revisions, ordered image roles, resize/rendering/prompt/output schemas, sequence
+limits, and LoRA topology. `contract_fingerprint` is SHA-256 over canonical JSON
+excluding the fingerprint field.
+
+The default LoRA topology is rank 16, alpha 32, dropout 0.05, bias none,
+text-all plus multimodal mergers, 260 target modules, target-list hash
+`fdff350e33d483666eb85ead6d1dc062df8739f2f6d78dc20663bf49fa755402`,
+and 44,793,856 trainable parameters.
+
+Artifact validation completes before the 8B model is allocated. Missing or
+unknown contracts, fingerprint mismatch, wrong base/revision, modified adapter
+configuration, or old ConceptSeg/Qwen2.5 checkpoints fail with no force bypass.
+
+`artifact init` wraps an existing PEFT adapter directory in a new immutable
+ConceptDet Artifact. It copies weights/config, validates topology metadata, and
+writes the contract and provenance atomically. Training stages later use the
+same Artifact Module to publish their output.
+
+## 8. Tracer bullet
+
+The first implementation slice proves the public seams without the 8B model:
+
+```text
+strict YAML
+  → DetectionRequest
+  → DetectionApplication(FakeAdapter)
+  → strict Detection Protocol
+  → pixel Detection Set + output JSON/image
+  → inspectable Artifact
+```
+
+Application tests inject a deterministic Fake Adapter through the same seam as
+Qwen3-VL. They assert only public outcomes, never adapter internals.
+
+The second slice replaces the Fake Adapter with Qwen3-VL and executes the same
+Detection Application and CLI. Old fixed-size/prompt/parser/model paths are
+deleted once replacement tests pass; they are not retained as compatibility
+layers.
+
+## 9. Dependency profiles
+
+- default: inference, configuration, data/protocol, evaluation primitives;
+- `train`: PEFT and bbox SFT dependencies, without TRL;
+- `grpo`: training plus pinned TRL;
+- `distributed`: optional DeepSpeed; Accelerate remains core;
+- `flash-attn`: separately installable hardware-specific acceleration;
+- `dev`: tests and lint.
+
+Missing profiles fail during validation with an exact install command before
+model allocation.
+
+## 10. Verification and resource gates
+
+Every PR runs CPU contract, Fake Adapter application, and two-process fake
+tests. Release/manual gates use the real pinned 8B model:
+
+- SFT lifecycle and SFT→native-GRPO lifecycle must each remain at or below
+  44.0 GiB process-local CUDA peak reserved memory;
+- real two-GPU DDP must pass before multi-GPU support is advertised;
+- ZeRO, multi-node, 4–8 GPU, and full fine-tuning are optional certifications.
+
+The inference slice must pass CPU tests, CLI Fake Adapter tests, Artifact
+validation, and a real base+adapter positive/negative strict-generation smoke.
+
+## 11. Implementation order
+
+1. Config, Detection Protocol, Artifact, Fake Adapter tracer bullet.
+2. Deterministic bbox manifest and offline VOC conversion.
+3. Real Qwen3-VL Adapter and inference replacement.
+4. Bbox SFT and one-GPU lifecycle.
+5. Confidence-free evaluation and frozen reports.
+6. SFT→native-GRPO.
+7. Resume, two-process tests, and real DDP certification.
+
+Each slice is independently reviewable and preserves the public interfaces
+defined here.
