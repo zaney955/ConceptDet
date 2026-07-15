@@ -1,0 +1,5 @@
+# Throwaway dependency lock for the Issue #11 hardware compatibility probe.
+-r runtime.txt
+-r flash-attention.txt
+peft==0.19.1
+trl==1.5.0
