@@ -60,6 +60,7 @@ conceptdet data voc --config FILE
 conceptdet train sft --config FILE [--resume none|auto|PATH]
 
 conceptdet train grpo --config FILE [--resume none|auto|PATH]
+conceptdet predict dataset --config FILE
 conceptdet evaluate --config FILE
 ```
 
@@ -88,6 +89,7 @@ Implemented v1 kinds:
 - `data.voc`
 - `train.sft`
 - `train.grpo`
+- `predict.dataset`
 - `evaluate`
 
 The Data Module treats VOC XML as the authoritative record set, validates image
@@ -103,6 +105,12 @@ ordering, atomic checkpoints, and explicit `none`, `auto`, or exact-path resume.
 Publication records dataset/config fingerprints and lifecycle provenance in the
 Adapter Artifact.
 
+The Prediction Module loads an immutable Adapter Artifact on one or more
+Accelerate ranks, shards a compiled dataset split by rank, and atomically
+publishes one ID-sorted raw-completion JSONL with exact coverage. It preserves
+malformed completions for strict evaluation and reduces only the completion
+budget when needed to honor the 1,536-token sequence contract.
+
 The Evaluation Module consumes a validated Dataset Artifact, immutable Adapter
 Artifact, and complete prediction JSONL containing `id` and the saved
 `raw_completion`. It never loads the model. It exact-matches Detection Sets,
@@ -117,8 +125,8 @@ ordered images, normalized truth, and record metadata to stock TRL 1.5
 generations, and 192 completion tokens. Reward is 10% strict format plus 90%
 soft Set-F1 from the Evaluation Module. Publication requires a nonzero-advantage
 group, changed adapter parameters, exact SFT lineage, strict save/reload
-generation, and the 44 GiB lifecycle gate. Resume modes other than `none` remain
-reserved for the distributed/resume certification slice.
+generation, and the 44 GiB lifecycle gate. Complete checkpoints support
+fail-closed `none`, `auto`, and explicit-path resume modes.
 
 Example detection config:
 

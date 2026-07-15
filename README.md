@@ -131,8 +131,9 @@ are ignored by `auto` and rejected when named explicitly.
 
 ## Acceptance gates and distributed launch
 
-Checked-in Accelerate profiles cover a two-process CPU Fake Adapter run and
-two-GPU DDP without embedding GPU selection in source or training config:
+Checked-in Accelerate profiles cover a two-process CPU Fake Adapter run,
+two-GPU DDP, and four-GPU DDP without embedding GPU selection in source or
+training config:
 
 ```bash
 .venv/bin/accelerate launch --config_file configs/accelerate/cpu-two-process.yaml \
@@ -216,6 +217,32 @@ dataset record; line order has no meaning:
 ```json
 {"id":"dataset-record-id","raw_completion":"[{\"bbox_2d\":[125,240,510,780]}]"}
 ```
+
+Generate that file directly from a compiled split with a typed
+`predict.dataset` configuration:
+
+```yaml
+schema_version: 1
+kind: predict.dataset
+dataset_dir: /path/to/compiled-dataset
+artifact: /path/to/sft-or-grpo-artifact
+predictions: /path/to/test-predictions.jsonl
+split: test
+runtime:
+  device: auto
+  dtype: bfloat16
+  attention: flash_attention_2
+  max_new_tokens: 192
+  local_files_only: true
+```
+
+```bash
+.venv/bin/accelerate launch --config_file configs/accelerate/ddp-four-gpu.yaml \
+  -m conceptdet predict dataset --config /tmp/predict.yaml
+```
+
+Each rank receives a deterministic disjoint shard. Rank zero validates exact
+coverage, sorts by record ID, and atomically publishes the single JSONL.
 
 Malformed completions remain legal evaluation inputs and reduce the
 `strict_valid_rate`; missing, duplicate, or extra record IDs fail closed. Run:

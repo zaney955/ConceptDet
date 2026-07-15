@@ -37,6 +37,7 @@ from conceptdet.model import (
     MIN_VISUAL_TOKENS,
     Qwen3VLAdapter,
     prepare_images,
+    smart_image_size,
 )
 from conceptdet.peft_weights import load_exact_adapter_weights
 from conceptdet.prompts import STRICT_DETECTION_PROMPT, build_messages
@@ -99,6 +100,38 @@ class GRPOBatchBuilder:
     def __init__(self, dataset: DatasetArtifact, processor: Any) -> None:
         self.dataset = dataset
         self.processor = processor
+        self._prepared_size_cache: dict[Path, tuple[int, int]] = {}
+
+    def _prepared_size(self, path: Path) -> tuple[int, int]:
+        cached = self._prepared_size_cache.get(path)
+        if cached is not None:
+            return cached
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(path) as opened:
+                    width, height = opened.size
+                    orientation = int(opened.getexif().get(274, 1))
+        except (OSError, TypeError, ValueError) as exc:
+            raise DatasetError(f"Cannot read GRPO image metadata: {path}") from exc
+        if orientation in {5, 6, 7, 8}:
+            width, height = height, width
+        prepared = smart_image_size((width, height))
+        self._prepared_size_cache[path] = prepared
+        return prepared
+
+    @staticmethod
+    def _truth(record: dict[str, Any]) -> tuple[Any, ...]:
+        raw_truth = record.get("detection_set")
+        if not isinstance(raw_truth, list):
+            raise DatasetError(f"GRPO record has no Detection Set: {record.get('id')}")
+        truth_json = json.dumps(
+            raw_truth, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        detections = parse_detection_set(truth_json)
+        if serialize_detection_set(detections) != truth_json:
+            raise DatasetError(f"GRPO truth is not canonical: {record.get('id')}")
+        return detections
 
     def build(self, record: dict[str, Any]) -> tuple[dict[str, Any], GRPOBatchProvenance]:
         request = detection_request(self.dataset, record)
@@ -110,15 +143,7 @@ class GRPOBatchBuilder:
                 request.query,
             )
         )
-        raw_truth = record.get("detection_set")
-        if not isinstance(raw_truth, list):
-            raise DatasetError(f"GRPO record has no Detection Set: {record.get('id')}")
-        truth_json = json.dumps(
-            raw_truth, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        )
-        detections = parse_detection_set(truth_json)
-        if serialize_detection_set(detections) != truth_json:
-            raise DatasetError(f"GRPO truth is not canonical: {record.get('id')}")
+        detections = self._truth(record)
 
         encoded = self.processor.apply_chat_template(
             build_messages(reference, target, request.query),
@@ -161,6 +186,54 @@ class GRPOBatchBuilder:
             "positive": bool(record["positive"]),
         }
         return prepared, GRPOBatchProvenance(
+            str(record["id"]),
+            bool(record["positive"]),
+            prompt_tokens,
+            grids,
+            None,
+            None,
+        )
+
+    def compatibility(self, record: dict[str, Any]) -> GRPOBatchProvenance:
+        """Compute the exact prompt/grid contract without allocating pixel tensors."""
+        request = detection_request(self.dataset, record)
+        self._truth(record)
+        sizes = [
+            self._prepared_size(path)
+            for path in (request.reference_image, request.target_image)
+        ]
+        patch_size = int(self.processor.image_processor.patch_size)
+        merge_size = int(self.processor.image_processor.merge_size)
+        grids = tuple((1, height // patch_size, width // patch_size) for width, height in sizes)
+        visual_tokens = [grid[1] * grid[2] // (merge_size**2) for grid in grids]
+        if any(
+            not MIN_VISUAL_TOKENS <= count <= MAX_VISUAL_TOKENS
+            for count in visual_tokens
+        ):
+            raise TrainingError(f"GRPO preflight image grids produce invalid tokens: {grids}")
+
+        placeholder = Image.new("RGB", (1, 1))
+        messages = build_messages(placeholder, placeholder, request.query)
+        rendered = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            add_vision_id=True,
+        )
+        token_ids = self.processor.tokenizer(rendered, add_special_tokens=False)[
+            "input_ids"
+        ]
+        image_token_id = int(self.processor.image_token_id)
+        if token_ids.count(image_token_id) != 2:
+            raise TrainingError("GRPO preflight expected exactly two image placeholders")
+        prompt_tokens = len(token_ids) - 2 + sum(visual_tokens)
+        if prompt_tokens + MAX_COMPLETION_TOKENS > MAX_TOTAL_SEQUENCE_TOKENS:
+            raise DatasetError(
+                f"GRPO record {record.get('id')} prompt has {prompt_tokens} tokens; "
+                f"prompt + {MAX_COMPLETION_TOKENS} must be <= {MAX_TOTAL_SEQUENCE_TOKENS} "
+                "and truncation is forbidden"
+            )
+        return GRPOBatchProvenance(
             str(record["id"]),
             bool(record["positive"]),
             prompt_tokens,
@@ -264,7 +337,7 @@ def _frontload_compatible_smoke_records(
     for index, record in enumerate(records):
         kind = bool(record["positive"])
         try:
-            _, provenance = builder.preflight(record)
+            provenance = builder.compatibility(record)
         except DatasetError as exc:
             if "prompt + 192" not in str(exc):
                 raise
@@ -283,7 +356,20 @@ def _frontload_compatible_smoke_records(
         raise TrainingError(
             "Could not find both positive and negative GRPO records within the 1,536-token contract"
         )
-    return compatible, (selected[True][1], selected[False][1]), excluded
+    positive_preflight = builder.preflight(selected[True][0])[1]
+    negative_preflight = builder.preflight(selected[False][0])[1]
+    for metadata_only, full in (
+        (selected[True][1], positive_preflight),
+        (selected[False][1], negative_preflight),
+    ):
+        if (
+            metadata_only.prompt_tokens != full.prompt_tokens
+            or metadata_only.image_grids != full.image_grids
+        ):
+            raise TrainingError(
+                "GRPO metadata preflight disagrees with full processor preflight"
+            )
+    return compatible, (positive_preflight, negative_preflight), excluded
 
 
 def _completion_text(completion: Any) -> str:
@@ -589,11 +675,17 @@ def run_grpo(
     memory_points.append(_memory(torch, device, "sft_parent_loaded"))
 
     recorder = _RewardRecorder()
+    generation_batch_size = max(NUM_GENERATIONS, context.world_size)
+    if generation_batch_size % NUM_GENERATIONS:
+        raise TrainingError(
+            f"GRPO world_size={context.world_size} is incompatible with "
+            f"num_generations={NUM_GENERATIONS}"
+        )
     trainer_args = GRPOConfig(
         output_dir=str(config.work_dir / "trainer"),
         per_device_train_batch_size=1,
         gradient_accumulation_steps=config.optimization.gradient_accumulation_steps,
-        generation_batch_size=2,
+        generation_batch_size=generation_batch_size,
         num_generations=NUM_GENERATIONS,
         temperature=GRPO_TEMPERATURE,
         num_train_epochs=config.optimization.epochs,
@@ -760,6 +852,7 @@ def run_grpo(
             "trl_version": EXPECTED_TRL_VERSION,
             "beta": 0.0,
             "num_generations": NUM_GENERATIONS,
+            "generation_batch_size": generation_batch_size,
             "temperature": GRPO_TEMPERATURE,
             "max_completion_tokens": MAX_COMPLETION_TOKENS,
             "optimizer_steps": optimizer_steps,
@@ -814,6 +907,7 @@ def run_grpo(
         "beta": 0.0,
         "reference_model": False,
         "num_generations": NUM_GENERATIONS,
+        "generation_batch_size": generation_batch_size,
         "temperature": GRPO_TEMPERATURE,
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
         "optimizer_inherited": False,

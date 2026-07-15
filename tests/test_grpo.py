@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,10 +21,22 @@ class _Dataset:
 
 
 class _Processor:
-    def __init__(self, prompt_tokens: int = 100) -> None:
+    def __init__(self, prompt_tokens: int = 300) -> None:
         self.prompt_tokens = prompt_tokens
+        self.image_processor = SimpleNamespace(patch_size=16, merge_size=2)
+        self.image_token_id = 999
 
-    def apply_chat_template(self, *_: object, **__: object) -> dict[str, torch.Tensor]:
+    def tokenizer(self, rendered: str, *, add_special_tokens: bool) -> dict[str, list[int]]:
+        assert add_special_tokens is False
+        prompt_tokens = 1345 if "overlength" in rendered else self.prompt_tokens
+        text_tokens = prompt_tokens - 128 + 2
+        return {"input_ids": [self.image_token_id, self.image_token_id] + [1] * (text_tokens - 2)}
+
+    def apply_chat_template(
+        self, messages: object, *_: object, **kwargs: object
+    ) -> dict[str, torch.Tensor] | str:
+        if kwargs.get("tokenize") is False:
+            return str(messages)
         return {
             "input_ids": torch.ones((1, self.prompt_tokens), dtype=torch.long),
             "image_grid_thw": torch.tensor([[1, 16, 16], [1, 16, 16]]),
@@ -58,7 +71,7 @@ def test_grpo_batch_uses_raw_prompt_ordered_images_and_normalized_truth(
     assert len(prepared["images"]) == 2
     assert prepared["ground_truth"] == [[100, 100, 300, 300]]
     assert prepared["positive"] is True
-    assert provenance.prompt_tokens == 100
+    assert provenance.prompt_tokens == 300
     assert provenance.image_grids == ((1, 16, 16), (1, 16, 16))
 
     with pytest.raises(DatasetError, match=r"prompt \+ 192"):
@@ -91,9 +104,11 @@ def test_grpo_full_preflight_excludes_overlength_without_truncation(
 
     class _VariableProcessor(_Processor):
         def apply_chat_template(
-            self, messages: object, *_: object, **__: object
-        ) -> dict[str, torch.Tensor]:
-            tokens = 1345 if "overlength" in str(messages) else 100
+            self, messages: object, *_: object, **kwargs: object
+        ) -> dict[str, torch.Tensor] | str:
+            if kwargs.get("tokenize") is False:
+                return str(messages)
+            tokens = 1345 if "overlength" in str(messages) else self.prompt_tokens
             return {
                 "input_ids": torch.ones((1, tokens), dtype=torch.long),
                 "image_grid_thw": torch.tensor([[1, 16, 16], [1, 16, 16]]),
