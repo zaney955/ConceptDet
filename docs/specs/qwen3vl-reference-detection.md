@@ -29,7 +29,7 @@ CLI Application
   │           └── Qwen3-VL Adapter
   ├── Manifest/Data Module
   ├── Artifact Module
-  ├── SFT Stage Module             (next slice)
+  ├── SFT Stage Module
   ├── Evaluation Module            (next slice)
   └── GRPO Stage Module            (next slice)
 ```
@@ -56,9 +56,10 @@ conceptdet config validate --config FILE
 conceptdet config render --config FILE [--output FILE]
 conceptdet artifact init --config FILE
 conceptdet artifact inspect ARTIFACT [--json]
+conceptdet data voc --config FILE
+conceptdet train sft --config FILE [--resume none|auto|PATH]
 
 # specified now, implemented in later slices
-conceptdet train sft --config FILE [--resume none|auto|PATH]
 conceptdet train grpo --config FILE [--resume none|auto|PATH]
 conceptdet evaluate --config FILE
 ```
@@ -85,9 +86,24 @@ Implemented v1 kinds:
 - `infer.detect`
 - `infer.batch`
 - `artifact.init`
+- `data.voc`
+- `train.sft`
 
-Reserved kinds `train.sft`, `train.grpo`, and `evaluate` fail with a targeted
+Reserved kinds `train.grpo` and `evaluate` fail with a targeted
 “not implemented by this release” error until their slices land.
+
+The Data Module treats VOC XML as the authoritative record set, validates image
+size and bbox semantics, retains all instances of the selected Visual Concept,
+groups exact duplicates and related capture sequences before splitting, and
+publishes byte-deterministic JSONL plus an audit and Dataset Artifact
+fingerprint. Empty XML annotations are legal negative Target Images; orphan
+images are audited but do not silently become training records.
+
+The SFT Stage Module consumes only a validated Dataset Artifact. It uses
+assistant-only labels, no packing or truncation, deterministic positive/negative
+ordering, atomic checkpoints, and explicit `none`, `auto`, or exact-path resume.
+Publication records dataset/config fingerprints and lifecycle provenance in the
+Adapter Artifact.
 
 Example detection config:
 
@@ -248,6 +264,9 @@ tests. Release/manual gates use the real pinned 8B model:
 
 The inference slice must pass CPU tests, CLI Fake Adapter tests, Artifact
 validation, and a real base+adapter positive/negative strict-generation smoke.
+The SFT slice must additionally complete train/save/release/reload/strict-generate
+with exactly 44,793,856 trainable parameters and no more than 44.0 GiB peak
+reserved memory.
 
 ## 11. Implementation order
 

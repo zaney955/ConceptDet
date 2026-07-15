@@ -1,0 +1,15 @@
+schema_version: 1
+kind: data.voc
+sources:
+  - name: dataset
+    images: /path/to/voc/images
+    annotations: /path/to/voc/xml
+classes: all
+output_dir: ../outputs/datasets/dataset-v1
+source_box_semantics: xyxy_half_open
+negative_per_image: 1
+splits:
+  train: 0.9
+  validation: 0.05
+  test: 0.05
+  seed: 17

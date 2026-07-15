@@ -1,0 +1,20 @@
+schema_version: 1
+kind: train.sft
+dataset_dir: ../outputs/datasets/dataset-v1
+work_dir: ../outputs/sft/run-001
+artifact_dir: ../artifacts/sft-run-001
+runtime:
+  device: cuda:0
+  dtype: bfloat16
+  attention: flash_attention_2
+  max_new_tokens: 192
+  local_files_only: false
+optimization:
+  epochs: 1
+  max_steps: null
+  learning_rate: 0.0002
+  gradient_accumulation_steps: 8
+  weight_decay: 0.01
+  warmup_steps: 100
+  checkpoint_steps: 100
+  seed: 17

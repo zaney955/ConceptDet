@@ -8,7 +8,8 @@ every matching Target Instance as a strict JSON Detection Set.
 The runtime is a clean break from ConceptSeg: there is no SAM, mask conversion,
 learnable query, connector, projection, fixed 600×600 input, or Qwen2.5
 compatibility path. The model-visible preprocessing and output contract are
-shared by inference and future bbox SFT/GRPO stages.
+shared by deterministic VOC conversion, bbox SFT, inference, and the future
+GRPO stage.
 
 ## Contract
 
@@ -39,6 +40,59 @@ bash scripts/create_env.sh
 
 The environment is local to this repository. Model files remain in the normal
 Hugging Face cache; adapters and generated outputs are ignored by Git.
+
+## Compile VOC bbox data
+
+Copy [examples/data-voc.yaml](examples/data-voc.yaml) and point each source at
+its image and XML directories. `source_box_semantics` must explicitly describe
+the XML coordinates; use `xyxy_half_open` for zero-based boundary coordinates
+or `voc_inclusive` for standard one-based VOC coordinates.
+
+```bash
+.venv/bin/python -m conceptdet config validate --config /tmp/data-voc.yaml
+.venv/bin/python -m conceptdet data voc --config /tmp/data-voc.yaml
+```
+
+The immutable compiled dataset contains `train.jsonl`, `validation.jsonl`,
+`test.jsonl`, `audit.json`, and `dataset.json`. Conversion retains every Target
+Instance for the selected Visual Concept, creates deterministic empty Detection
+Sets, groups duplicate/related images before splitting, chooses Reference Images
+only inside the Target Image split, and hashes every output. XML files are the
+authoritative record set; images without XML are listed as orphans in the audit.
+An XML without an image, a mismatched size, malformed XML, or an invalid bbox
+fails with its source XML and object index.
+
+## Bbox-native SFT
+
+Copy [examples/train-sft.yaml](examples/train-sft.yaml), set the compiled
+dataset, work, and Artifact paths, then run:
+
+```bash
+.venv/bin/python -m conceptdet config validate --config /tmp/train-sft.yaml
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m conceptdet train sft \
+  --config /tmp/train-sft.yaml --resume none
+```
+
+SFT uses the official Qwen3-VL Transformers path, rank-16 text-all plus
+multimodal-merger LoRA, frozen base/vision parameters, assistant-only labels,
+no packing, and no truncation. Checkpoints atomically preserve adapter,
+optimizer, scheduler, dataset/config fingerprints, and the exact schedule
+position. Resume is explicit:
+
+```bash
+# Latest valid checkpoint in work_dir
+.venv/bin/python -m conceptdet train sft --config /tmp/train-sft.yaml --resume auto
+
+# Specific checkpoint
+.venv/bin/python -m conceptdet train sft --config /tmp/train-sft.yaml \
+  --resume /path/to/checkpoint-00000100
+```
+
+On completion, the stage saves and releases the training model, publishes an
+immutable Artifact, reloads it, runs strict positive/negative generation, and
+enforces the 44 GiB peak-reserved gate. A short lifecycle run proves mechanics;
+it is not a quality-trained model. Use `max_steps: null` for the configured full
+epoch schedule.
 
 ## Wrap a PEFT adapter as an Artifact
 
@@ -109,5 +163,7 @@ PYTHONPATH=src .venv/bin/python -m pytest -q
 
 The application depends on the small `DetectionAdapter` interface. CPU tests
 use its deterministic Fake Adapter; production uses `Qwen3VLAdapter` through
-the same path. Current implementation tickets are tracked in
+the same path. Dataset compilation and SFT similarly expose one small interface
+each while hiding pairing, grouping, token masking, checkpoint, and publication
+details. Current implementation tickets are tracked in
 [GitHub epic #14](https://github.com/zaney955/ConceptDet/issues/14).

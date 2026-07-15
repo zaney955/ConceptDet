@@ -2,7 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from conceptdet.config import ArtifactInitConfig, DetectConfig, config_to_dict, load_config
+from conceptdet.config import (
+    ArtifactInitConfig,
+    DataVocConfig,
+    DetectConfig,
+    SFTStageConfig,
+    config_to_dict,
+    load_config,
+)
 from conceptdet.errors import ConfigurationError
 from conceptdet.types import Box
 
@@ -69,7 +76,7 @@ def test_config_rejects_duplicates_unknown_and_legacy_fields(tmp_path: Path) -> 
 def test_reserved_training_kind_has_targeted_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigurationError, match="not implemented"):
         load_config(
-            _write(tmp_path / "sft.yaml", "schema_version: 1\nkind: train.sft\n")
+            _write(tmp_path / "grpo.yaml", "schema_version: 1\nkind: train.grpo\n")
         )
 
 
@@ -88,3 +95,44 @@ stage: grpo
     config = load_config(_write(tmp_path / "artifact-valid.yaml", body))
     assert isinstance(config, ArtifactInitConfig)
     assert config.parent_artifact == (tmp_path / "parent").resolve()
+
+
+def test_data_voc_and_sft_configs_are_strict_and_resolved(tmp_path: Path) -> None:
+    data = load_config(
+        _write(
+            tmp_path / "data.yaml",
+            """
+schema_version: 1
+kind: data.voc
+sources:
+  - name: fixture
+    images: images
+    annotations: xml
+classes: all
+output_dir: compiled
+negative_per_image: 1
+splits: {train: 0.8, validation: 0.1, test: 0.1, seed: 17}
+""",
+        )
+    )
+    assert isinstance(data, DataVocConfig)
+    assert data.sources[0].image_dir == (tmp_path / "images").resolve()
+    assert data.classes is None
+
+    sft = load_config(
+        _write(
+            tmp_path / "sft.yaml",
+            """
+schema_version: 1
+kind: train.sft
+dataset_dir: compiled
+work_dir: work
+artifact_dir: artifact
+runtime: {device: cuda:0, local_files_only: true}
+optimization: {epochs: 1, max_steps: 2, gradient_accumulation_steps: 2}
+""",
+        )
+    )
+    assert isinstance(sft, SFTStageConfig)
+    assert sft.optimization.max_steps == 2
+    assert sft.runtime.local_files_only is True

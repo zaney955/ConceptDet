@@ -12,8 +12,10 @@ from conceptdet.errors import ConfigurationError
 from conceptdet.types import Box
 
 SCHEMA_VERSION = 1
-SUPPORTED_KINDS = frozenset({"infer.detect", "infer.batch", "artifact.init"})
-RESERVED_KINDS = frozenset({"train.sft", "train.grpo", "evaluate"})
+SUPPORTED_KINDS = frozenset(
+    {"infer.detect", "infer.batch", "artifact.init", "data.voc", "train.sft"}
+)
+RESERVED_KINDS = frozenset({"train.grpo", "evaluate"})
 LEGACY_KEYS = frozenset(
     {
         "model_path",
@@ -121,8 +123,62 @@ class ArtifactInitConfig:
     config_hash: str
 
 
+@dataclass(frozen=True)
+class VocSourceConfig:
+    name: str
+    image_dir: Path
+    annotation_dir: Path
+
+
+@dataclass(frozen=True)
+class SplitConfig:
+    train: float = 0.9
+    validation: float = 0.05
+    test: float = 0.05
+    seed: int = 17
+
+
+@dataclass(frozen=True)
+class DataVocConfig:
+    schema_version: int
+    kind: Literal["data.voc"]
+    sources: tuple[VocSourceConfig, ...]
+    classes: tuple[str, ...] | None
+    output_dir: Path
+    source_box_semantics: Literal["voc_inclusive", "xyxy_half_open"]
+    negative_per_image: int
+    splits: SplitConfig
+    config_path: Path
+    config_hash: str
+
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    epochs: float = 1.0
+    max_steps: int | None = None
+    learning_rate: float = 2e-4
+    gradient_accumulation_steps: int = 8
+    weight_decay: float = 0.01
+    warmup_steps: int = 0
+    checkpoint_steps: int = 100
+    seed: int = 17
+
+
+@dataclass(frozen=True)
+class SFTStageConfig:
+    schema_version: int
+    kind: Literal["train.sft"]
+    dataset_dir: Path
+    work_dir: Path
+    artifact_dir: Path
+    runtime: RuntimeConfig
+    optimization: OptimizationConfig
+    config_path: Path
+    config_hash: str
+
+
 ConceptDetConfig: TypeAlias = (  # noqa: UP040 - package supports Python 3.10
-    DetectConfig | BatchConfig | ArtifactInitConfig
+    DetectConfig | BatchConfig | ArtifactInitConfig | DataVocConfig | SFTStageConfig
 )
 
 
@@ -186,6 +242,18 @@ def _boolean(value: object, path: str) -> bool:
     return value
 
 
+def _integer(value: object, path: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ConfigurationError(f"{path} must be an integer >= {minimum}")
+    return value
+
+
+def _number(value: object, path: str, *, minimum: float = 0.0) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+        raise ConfigurationError(f"{path} must be a number >= {minimum}")
+    return float(value)
+
+
 def _runtime(value: object) -> RuntimeConfig:
     raw = _mapping(
         value or {},
@@ -221,6 +289,98 @@ def _boxes(value: object, path: str) -> tuple[Box, ...]:
         return tuple(Box.from_sequence(box) for box in value)
     except Exception as exc:
         raise ConfigurationError(f"{path} contains an invalid XYXY box: {exc}") from exc
+
+
+def _voc_sources(value: object, base: Path) -> tuple[VocSourceConfig, ...]:
+    if not isinstance(value, list) or not value:
+        raise ConfigurationError("$.sources must contain at least one VOC source")
+    sources: list[VocSourceConfig] = []
+    names: set[str] = set()
+    for index, item in enumerate(value):
+        path = f"$.sources[{index}]"
+        raw = _mapping(
+            item,
+            path,
+            allowed={"name", "images", "annotations"},
+            required={"name", "images", "annotations"},
+        )
+        name = _text(raw["name"], f"{path}.name")
+        if name in names:
+            raise ConfigurationError(f"Duplicate VOC source name: {name}")
+        names.add(name)
+        sources.append(
+            VocSourceConfig(
+                name,
+                _path(raw["images"], f"{path}.images", base),
+                _path(raw["annotations"], f"{path}.annotations", base),
+            )
+        )
+    return tuple(sources)
+
+
+def _splits(value: object) -> SplitConfig:
+    raw = _mapping(
+        value or {},
+        "$.splits",
+        allowed={"train", "validation", "test", "seed"},
+    )
+    train = _number(raw.get("train", 0.9), "$.splits.train")
+    validation = _number(raw.get("validation", 0.05), "$.splits.validation")
+    test = _number(raw.get("test", 0.05), "$.splits.test")
+    if min(train, validation, test) <= 0 or abs(train + validation + test - 1.0) > 1e-9:
+        raise ConfigurationError("$.splits ratios must be positive and sum to 1")
+    return SplitConfig(
+        train,
+        validation,
+        test,
+        _integer(raw.get("seed", 17), "$.splits.seed"),
+    )
+
+
+def _optimization(value: object) -> OptimizationConfig:
+    raw = _mapping(
+        value or {},
+        "$.optimization",
+        allowed={
+            "epochs",
+            "max_steps",
+            "learning_rate",
+            "gradient_accumulation_steps",
+            "weight_decay",
+            "warmup_steps",
+            "checkpoint_steps",
+            "seed",
+        },
+    )
+    maximum = raw.get("max_steps")
+    if maximum is not None:
+        maximum = _integer(maximum, "$.optimization.max_steps", minimum=1)
+    epochs = _number(raw.get("epochs", 1.0), "$.optimization.epochs")
+    if epochs <= 0:
+        raise ConfigurationError("$.optimization.epochs must be > 0")
+    learning_rate = _number(
+        raw.get("learning_rate", 2e-4), "$.optimization.learning_rate"
+    )
+    if learning_rate <= 0:
+        raise ConfigurationError("$.optimization.learning_rate must be > 0")
+    return OptimizationConfig(
+        epochs,
+        maximum,
+        learning_rate,
+        _integer(
+            raw.get("gradient_accumulation_steps", 8),
+            "$.optimization.gradient_accumulation_steps",
+            minimum=1,
+        ),
+        _number(raw.get("weight_decay", 0.01), "$.optimization.weight_decay"),
+        _integer(raw.get("warmup_steps", 0), "$.optimization.warmup_steps"),
+        _integer(
+            raw.get("checkpoint_steps", 100),
+            "$.optimization.checkpoint_steps",
+            minimum=1,
+        ),
+        _integer(raw.get("seed", 17), "$.optimization.seed"),
+    )
 
 
 def _canonical_hash(payload: dict[str, Any]) -> str:
@@ -261,6 +421,15 @@ def load_config(path: str | Path) -> ConceptDetConfig:
             "source_adapter",
             "stage",
             "parent_artifact",
+            "sources",
+            "classes",
+            "source_box_semantics",
+            "negative_per_image",
+            "splits",
+            "dataset_dir",
+            "work_dir",
+            "artifact_dir",
+            "optimization",
         },
         required={"schema_version", "kind"},
     )
@@ -352,6 +521,94 @@ def load_config(path: str | Path) -> ConceptDetConfig:
             "",
         ))
 
+    if kind == "data.voc":
+        _mapping(
+            root,
+            "$",
+            allowed={
+                "schema_version",
+                "kind",
+                "sources",
+                "classes",
+                "output_dir",
+                "source_box_semantics",
+                "negative_per_image",
+                "splits",
+            },
+            required={"schema_version", "kind", "sources", "output_dir"},
+        )
+        raw_classes = root.get("classes", "all")
+        if raw_classes == "all":
+            classes: tuple[str, ...] | None = None
+        elif (
+            isinstance(raw_classes, list)
+            and raw_classes
+            and all(isinstance(item, str) and item.strip() for item in raw_classes)
+        ):
+            classes = tuple(sorted({item.strip() for item in raw_classes}))
+            if len(classes) != len(raw_classes):
+                raise ConfigurationError("$.classes must not contain duplicates")
+        else:
+            raise ConfigurationError("$.classes must be 'all' or a nonempty string list")
+        semantics = root.get("source_box_semantics", "voc_inclusive")
+        if semantics not in {"voc_inclusive", "xyxy_half_open"}:
+            raise ConfigurationError(
+                "$.source_box_semantics must be voc_inclusive or xyxy_half_open"
+            )
+        return _finalize_hash(
+            DataVocConfig(
+                1,
+                "data.voc",
+                _voc_sources(root["sources"], base),
+                classes,
+                _path(root["output_dir"], "$.output_dir", base),
+                semantics,
+                _integer(
+                    root.get("negative_per_image", 1),
+                    "$.negative_per_image",
+                    minimum=1,
+                ),
+                _splits(root.get("splits")),
+                config_path,
+                "",
+            )
+        )
+
+    if kind == "train.sft":
+        _mapping(
+            root,
+            "$",
+            allowed={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "work_dir",
+                "artifact_dir",
+                "runtime",
+                "optimization",
+            },
+            required={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "work_dir",
+                "artifact_dir",
+            },
+        )
+        return _finalize_hash(
+            SFTStageConfig(
+                1,
+                "train.sft",
+                _path(root["dataset_dir"], "$.dataset_dir", base),
+                _path(root["work_dir"], "$.work_dir", base),
+                _path(root["artifact_dir"], "$.artifact_dir", base),
+                _runtime(root.get("runtime")),
+                _optimization(root.get("optimization")),
+                config_path,
+                "",
+            )
+        )
+
     _mapping(
         root,
         "$",
@@ -413,6 +670,36 @@ def config_to_dict(config: ConceptDetConfig) -> dict[str, Any]:
             "layout": config.layout,
             "overwrite": config.overwrite,
             "runtime": config.runtime.__dict__,
+            "config_hash": config.config_hash,
+        }
+    if isinstance(config, DataVocConfig):
+        return {
+            "schema_version": 1,
+            "kind": config.kind,
+            "sources": [
+                {
+                    "name": source.name,
+                    "images": str(source.image_dir),
+                    "annotations": str(source.annotation_dir),
+                }
+                for source in config.sources
+            ],
+            "classes": list(config.classes) if config.classes is not None else "all",
+            "output_dir": str(config.output_dir),
+            "source_box_semantics": config.source_box_semantics,
+            "negative_per_image": config.negative_per_image,
+            "splits": config.splits.__dict__,
+            "config_hash": config.config_hash,
+        }
+    if isinstance(config, SFTStageConfig):
+        return {
+            "schema_version": 1,
+            "kind": config.kind,
+            "dataset_dir": str(config.dataset_dir),
+            "work_dir": str(config.work_dir),
+            "artifact_dir": str(config.artifact_dir),
+            "runtime": config.runtime.__dict__,
+            "optimization": config.optimization.__dict__,
             "config_hash": config.config_hash,
         }
     return {

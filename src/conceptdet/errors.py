@@ -20,3 +20,11 @@ class ConfigurationError(ConceptDetError):
 
 class ArtifactError(ConceptDetError):
     """Raised when an Adapter Artifact is missing, mutable, or incompatible."""
+
+
+class DatasetError(ConceptDetError):
+    """Raised when a compiled Detection Set dataset is invalid or incompatible."""
+
+
+class TrainingError(ConceptDetError):
+    """Raised when an SFT stage violates its data, lifecycle, or resource contract."""

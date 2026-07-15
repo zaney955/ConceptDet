@@ -48,9 +48,12 @@ def test_initialize_and_inspect_immutable_artifact(tmp_path: Path) -> None:
         tmp_path / "config.yaml",
         "config-hash",
     )
-    created = initialize_artifact(config)
+    created = initialize_artifact(
+        config, provenance={"dataset_fingerprint": "dataset-hash", "steps": 2}
+    )
     assert created.path == output
     assert created.summary["stage"] == "sft"
+    assert created.summary["provenance"]["dataset_fingerprint"] == "dataset-hash"
     assert len(created.fingerprint) == 64
     assert AdapterArtifact.load(output).fingerprint == created.fingerprint
     with pytest.raises(ArtifactError, match="already exists"):

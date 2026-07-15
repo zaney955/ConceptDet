@@ -18,16 +18,20 @@ from conceptdet.artifact import (
 from conceptdet.config import (
     ArtifactInitConfig,
     BatchConfig,
+    DataVocConfig,
     DetectConfig,
     OutputConfig,
     RequestConfig,
+    SFTStageConfig,
     config_to_dict,
     load_config,
 )
+from conceptdet.dataset import DatasetArtifact, compile_voc_dataset
 from conceptdet.errors import (
     ArtifactError,
     ConceptDetError,
     ConfigurationError,
+    DatasetError,
     InputError,
 )
 from conceptdet.model import Qwen3VLAdapter
@@ -43,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="conceptdet", description="Qwen3-VL reference-guided Detection Sets"
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.4.0")
     domains = parser.add_subparsers(dest="domain", required=True)
 
     infer = domains.add_parser("infer", help="Run reference-guided inference")
@@ -64,6 +68,20 @@ def build_parser() -> argparse.ArgumentParser:
     inspect = artifact_commands.add_parser("inspect")
     inspect.add_argument("artifact", type=Path)
     inspect.add_argument("--json", action="store_true")
+
+    data = domains.add_parser("data", help="Compile bbox-native training datasets")
+    data_commands = data.add_subparsers(dest="operation", required=True)
+    _config_argument(data_commands.add_parser("voc", help="Compile VOC XML into JSONL"))
+
+    train = domains.add_parser("train", help="Run bbox-native training stages")
+    train_commands = train.add_subparsers(dest="operation", required=True)
+    sft = train_commands.add_parser("sft", help="Run Qwen3-VL LoRA SFT")
+    _config_argument(sft)
+    sft.add_argument(
+        "--resume",
+        default="none",
+        help="none, auto, or an explicit checkpoint directory",
+    )
     return parser
 
 
@@ -71,7 +89,9 @@ def _load_adapter(config: DetectConfig | BatchConfig) -> Qwen3VLAdapter:
     return Qwen3VLAdapter.load(config.artifact, config.runtime)
 
 
-def _validate_resources(config: DetectConfig | BatchConfig | ArtifactInitConfig) -> None:
+def _validate_resources(
+    config: DetectConfig | BatchConfig | ArtifactInitConfig | DataVocConfig | SFTStageConfig,
+) -> None:
     if isinstance(config, DetectConfig):
         AdapterArtifact.load(config.artifact)
         for description, path in (
@@ -90,12 +110,31 @@ def _validate_resources(config: DetectConfig | BatchConfig | ArtifactInitConfig)
             ):
                 if not path.is_file():
                     raise InputError(f"{description.capitalize()} does not exist: {path}")
-    else:
+    elif isinstance(config, ArtifactInitConfig):
         validate_source_adapter(config.source_adapter)
         if config.output_dir.exists():
             raise ArtifactError(f"Artifact output already exists: {config.output_dir}")
         if config.parent_artifact is not None:
             AdapterArtifact.load(config.parent_artifact)
+    elif isinstance(config, DataVocConfig):
+        for source in config.sources:
+            if not source.image_dir.is_dir():
+                raise DatasetError(f"VOC image directory does not exist: {source.image_dir}")
+            if not source.annotation_dir.is_dir():
+                raise DatasetError(
+                    f"VOC annotation directory does not exist: {source.annotation_dir}"
+                )
+        if config.output_dir.exists():
+            raise DatasetError(
+                f"Compiled dataset output already exists: {config.output_dir}"
+            )
+    else:
+        from conceptdet.training import validate_sft_dataset
+
+        dataset = DatasetArtifact.load(config.dataset_dir)
+        validate_sft_dataset(dataset)
+        if config.artifact_dir.exists():
+            raise ArtifactError(f"SFT Artifact output already exists: {config.artifact_dir}")
 
 
 def _safe_name(value: str) -> str:
@@ -256,6 +295,46 @@ def _execute(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if args.domain == "data":
+        if not isinstance(config, DataVocConfig):
+            raise ConfigurationError("data voc requires kind: data.voc")
+        dataset = compile_voc_dataset(config)
+        print(
+            json.dumps(
+                {
+                    "dataset": str(dataset.path),
+                    "dataset_fingerprint": dataset.fingerprint,
+                    "files": dataset.metadata["files"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    if args.domain == "train":
+        if not isinstance(config, SFTStageConfig):
+            raise ConfigurationError("train sft requires kind: train.sft")
+        from conceptdet.training import run_sft
+
+        resume: str | Path = args.resume
+        if resume not in {"none", "auto"}:
+            resume = Path(resume)
+        result = run_sft(config, resume=resume)  # type: ignore[arg-type]
+        print(
+            json.dumps(
+                {
+                    "artifact": str(result.artifact.path),
+                    "artifact_fingerprint": result.artifact.fingerprint,
+                    "optimizer_steps": result.optimizer_steps,
+                    "micro_steps": result.micro_steps,
+                    "final_loss": result.final_loss,
+                    "peak_reserved_gib": result.peak_reserved_gib,
+                    "lifecycle_report": str(result.lifecycle_report),
+                }
+            )
+        )
+        return 0
+
     if args.operation == "detect":
         if not isinstance(config, DetectConfig):
             raise ConfigurationError("infer detect requires kind: infer.detect")
@@ -275,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return _execute(args)
-    except (ConfigurationError, ArtifactError, InputError) as exc:
+    except (ConfigurationError, ArtifactError, DatasetError, InputError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except (ConceptDetError, OSError, ValueError) as exc:

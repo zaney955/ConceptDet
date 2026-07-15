@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 
@@ -11,7 +12,16 @@ from conceptdet.artifact import (
     WEIGHTS_FILE,
     initialize_artifact,
 )
-from conceptdet.config import ArtifactInitConfig, load_config
+from conceptdet.config import (
+    ArtifactInitConfig,
+    DataVocConfig,
+    OptimizationConfig,
+    RuntimeConfig,
+    SFTStageConfig,
+    SplitConfig,
+    VocSourceConfig,
+    load_config,
+)
 
 
 def _artifact(tmp_path: Path) -> Path:
@@ -168,3 +178,75 @@ runtime:
     ]
     assert summary[0]["status"] == "ok"
     assert summary[0]["detection_set"] == []
+
+
+def test_data_voc_cli_reports_dataset_fingerprint(tmp_path: Path, monkeypatch, capsys) -> None:
+    config = DataVocConfig(
+        1,
+        "data.voc",
+        (VocSourceConfig("fixture", tmp_path, tmp_path),),
+        None,
+        tmp_path / "compiled",
+        "xyxy_half_open",
+        1,
+        SplitConfig(),
+        tmp_path / "data.yaml",
+        "config-hash",
+    )
+    compiled = SimpleNamespace(
+        path=config.output_dir,
+        fingerprint="dataset-fingerprint",
+        metadata={"files": {"train.jsonl": {"records": 3}}},
+    )
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(cli, "compile_voc_dataset", lambda _: compiled)
+    assert cli.main(["data", "voc", "--config", str(config.config_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dataset_fingerprint"] == "dataset-fingerprint"
+
+
+def test_train_sft_cli_forwards_explicit_resume(tmp_path: Path, monkeypatch, capsys) -> None:
+    import conceptdet.training as training
+
+    config = SFTStageConfig(
+        1,
+        "train.sft",
+        tmp_path / "dataset",
+        tmp_path / "work",
+        tmp_path / "artifact",
+        RuntimeConfig(),
+        OptimizationConfig(max_steps=2),
+        tmp_path / "sft.yaml",
+        "config-hash",
+    )
+    received: list[object] = []
+
+    def fake_run(_: object, *, resume: object) -> SimpleNamespace:
+        received.append(resume)
+        return SimpleNamespace(
+            artifact=SimpleNamespace(path=config.artifact_dir, fingerprint="artifact-hash"),
+            optimizer_steps=2,
+            micro_steps=6,
+            final_loss=1.0,
+            peak_reserved_gib=28.0,
+            lifecycle_report=config.work_dir / "lifecycle.json",
+        )
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(training, "run_sft", fake_run)
+    checkpoint = tmp_path / "checkpoint-1"
+    assert (
+        cli.main(
+            [
+                "train",
+                "sft",
+                "--config",
+                str(config.config_path),
+                "--resume",
+                str(checkpoint),
+            ]
+        )
+        == 0
+    )
+    assert received == [checkpoint]
+    assert json.loads(capsys.readouterr().out)["artifact_fingerprint"] == "artifact-hash"

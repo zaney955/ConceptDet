@@ -235,7 +235,9 @@ class AdapterArtifact:
         return cls(artifact_path, contract, summary, adapter_config)
 
 
-def initialize_artifact(config: ArtifactInitConfig) -> AdapterArtifact:
+def initialize_artifact(
+    config: ArtifactInitConfig, *, provenance: dict[str, Any] | None = None
+) -> AdapterArtifact:
     source = config.source_adapter
     source_weights = source / WEIGHTS_FILE
     source_config = source / ADAPTER_CONFIG_FILE
@@ -265,6 +267,7 @@ def initialize_artifact(config: ArtifactInitConfig) -> AdapterArtifact:
             "parent_artifact_fingerprint": parent_fingerprint,
             "source_adapter": str(source),
             "init_config_hash": config.config_hash,
+            "provenance": provenance or {},
             "files": {
                 WEIGHTS_FILE: _sha256_file(temporary / WEIGHTS_FILE),
                 ADAPTER_CONFIG_FILE: _sha256_file(temporary / ADAPTER_CONFIG_FILE),
