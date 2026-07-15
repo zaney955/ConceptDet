@@ -13,9 +13,9 @@ from conceptdet.types import Box
 
 SCHEMA_VERSION = 1
 SUPPORTED_KINDS = frozenset(
-    {"infer.detect", "infer.batch", "artifact.init", "data.voc", "train.sft"}
+    {"infer.detect", "infer.batch", "artifact.init", "data.voc", "train.sft", "evaluate"}
 )
-RESERVED_KINDS = frozenset({"train.grpo", "evaluate"})
+RESERVED_KINDS = frozenset({"train.grpo"})
 LEGACY_KEYS = frozenset(
     {
         "model_path",
@@ -177,8 +177,26 @@ class SFTStageConfig:
     config_hash: str
 
 
+@dataclass(frozen=True)
+class EvaluationConfig:
+    schema_version: int
+    kind: Literal["evaluate"]
+    dataset_dir: Path
+    artifact: Path
+    predictions: Path
+    split: Literal["train", "validation", "test"]
+    output_dir: Path
+    config_path: Path
+    config_hash: str
+
+
 ConceptDetConfig: TypeAlias = (  # noqa: UP040 - package supports Python 3.10
-    DetectConfig | BatchConfig | ArtifactInitConfig | DataVocConfig | SFTStageConfig
+    DetectConfig
+    | BatchConfig
+    | ArtifactInitConfig
+    | DataVocConfig
+    | SFTStageConfig
+    | EvaluationConfig
 )
 
 
@@ -430,6 +448,8 @@ def load_config(path: str | Path) -> ConceptDetConfig:
             "work_dir",
             "artifact_dir",
             "optimization",
+            "predictions",
+            "split",
         },
         required={"schema_version", "kind"},
     )
@@ -609,6 +629,45 @@ def load_config(path: str | Path) -> ConceptDetConfig:
             )
         )
 
+    if kind == "evaluate":
+        _mapping(
+            root,
+            "$",
+            allowed={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "artifact",
+                "predictions",
+                "split",
+                "output_dir",
+            },
+            required={
+                "schema_version",
+                "kind",
+                "dataset_dir",
+                "artifact",
+                "predictions",
+                "output_dir",
+            },
+        )
+        split = root.get("split", "test")
+        if split not in {"train", "validation", "test"}:
+            raise ConfigurationError("$.split must be train, validation, or test")
+        return _finalize_hash(
+            EvaluationConfig(
+                1,
+                "evaluate",
+                _path(root["dataset_dir"], "$.dataset_dir", base),
+                _path(root["artifact"], "$.artifact", base),
+                _path(root["predictions"], "$.predictions", base),
+                split,
+                _path(root["output_dir"], "$.output_dir", base),
+                config_path,
+                "",
+            )
+        )
+
     _mapping(
         root,
         "$",
@@ -700,6 +759,17 @@ def config_to_dict(config: ConceptDetConfig) -> dict[str, Any]:
             "artifact_dir": str(config.artifact_dir),
             "runtime": config.runtime.__dict__,
             "optimization": config.optimization.__dict__,
+            "config_hash": config.config_hash,
+        }
+    if isinstance(config, EvaluationConfig):
+        return {
+            "schema_version": 1,
+            "kind": config.kind,
+            "dataset_dir": str(config.dataset_dir),
+            "artifact": str(config.artifact),
+            "predictions": str(config.predictions),
+            "split": config.split,
+            "output_dir": str(config.output_dir),
             "config_hash": config.config_hash,
         }
     return {

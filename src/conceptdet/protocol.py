@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -109,29 +108,105 @@ def box_iou(left: Box, right: Box) -> float:
     return intersection / union if union else 0.0
 
 
+def maximum_iou_assignment(
+    predictions: Sequence[Box],
+    targets: Sequence[Box],
+    *,
+    threshold: float | None = None,
+) -> tuple[tuple[tuple[int, int, float], ...], float]:
+    """Return an exact maximum-weight one-to-one IoU assignment.
+
+    With a threshold, cardinality is maximized before total IoU. Without one,
+    total IoU alone is maximized. A small residual-network implementation keeps
+    this exact for Detection Sets larger than the old bit-mask matcher limit.
+    """
+    if threshold is not None and not 0 <= threshold <= 1:
+        raise ValueError("IoU threshold must be between zero and one")
+    if not predictions or not targets:
+        return (), 0.0
+
+    prediction_count = len(predictions)
+    target_count = len(targets)
+    source = prediction_count + target_count
+    sink = source + 1
+    graph: list[list[list[float | int]]] = [[] for _ in range(sink + 1)]
+
+    def add_edge(left: int, right: int, capacity: int, cost: float) -> None:
+        forward: list[float | int] = [right, len(graph[right]), capacity, cost]
+        reverse: list[float | int] = [left, len(graph[left]), 0, -cost]
+        graph[left].append(forward)
+        graph[right].append(reverse)
+
+    for prediction_index in range(prediction_count):
+        add_edge(source, prediction_index, 1, 0.0)
+    for target_index in range(target_count):
+        add_edge(prediction_count + target_index, sink, 1, 0.0)
+
+    cardinality_bonus = float(min(prediction_count, target_count) + 1)
+    for prediction_index, prediction in enumerate(predictions):
+        for target_index, target in enumerate(targets):
+            iou = box_iou(prediction, target)
+            if threshold is not None and iou < threshold:
+                continue
+            if threshold is None and iou <= 0:
+                continue
+            reward = iou + (cardinality_bonus if threshold is not None else 0.0)
+            add_edge(prediction_index, prediction_count + target_index, 1, -reward)
+
+    # Successive shortest augmenting paths. Bellman-Ford is deliberate: residual
+    # reverse edges have negative/positive costs and Detection Sets are small.
+    while True:
+        distances = [float("inf")] * len(graph)
+        previous: list[tuple[int, int] | None] = [None] * len(graph)
+        distances[source] = 0.0
+        for _ in range(len(graph) - 1):
+            changed = False
+            for node, edges in enumerate(graph):
+                if distances[node] == float("inf"):
+                    continue
+                for edge_index, edge in enumerate(edges):
+                    destination, _, capacity, cost = edge
+                    if int(capacity) <= 0:
+                        continue
+                    candidate = distances[node] + float(cost)
+                    if candidate < distances[int(destination)] - 1e-12:
+                        distances[int(destination)] = candidate
+                        previous[int(destination)] = (node, edge_index)
+                        changed = True
+            if not changed:
+                break
+        if previous[sink] is None or distances[sink] >= -1e-12:
+            break
+        node = sink
+        while node != source:
+            prior = previous[node]
+            if prior is None:  # pragma: no cover - guarded by the sink path
+                raise RuntimeError("Incomplete assignment augmenting path")
+            parent, edge_index = prior
+            edge = graph[parent][edge_index]
+            reverse_index = int(edge[1])
+            edge[2] = int(edge[2]) - 1
+            graph[node][reverse_index][2] = int(graph[node][reverse_index][2]) + 1
+            node = parent
+
+    matches: list[tuple[int, int, float]] = []
+    for prediction_index in range(prediction_count):
+        for edge in graph[prediction_index]:
+            destination, _, capacity, _ = edge
+            target_index = int(destination) - prediction_count
+            if not 0 <= target_index < target_count or int(capacity) != 0:
+                continue
+            iou = box_iou(predictions[prediction_index], targets[target_index])
+            if iou > 0 or threshold == 0:
+                matches.append((prediction_index, target_index, iou))
+    matches.sort()
+    return tuple(matches), sum(match[2] for match in matches)
+
+
 def hard_set_counts(
     predictions: Sequence[Box], targets: Sequence[Box], threshold: float
 ) -> tuple[int, int, int]:
     """Exact maximum-cardinality matching with maximum-IoU tie breaking."""
-    if not 0 <= threshold <= 1:
-        raise ValueError("IoU threshold must be between zero and one")
-    if len(predictions) > 20 or len(targets) > 20:
-        raise ValueError("exact matcher supports at most 20 predictions and targets")
-
-    @functools.cache
-    def solve(target_index: int, used: int) -> tuple[int, float]:
-        if target_index == len(targets):
-            return 0, 0.0
-        best = solve(target_index + 1, used)
-        for prediction_index, prediction in enumerate(predictions):
-            if used & (1 << prediction_index):
-                continue
-            iou = box_iou(prediction, targets[target_index])
-            if iou < threshold:
-                continue
-            count, total_iou = solve(target_index + 1, used | (1 << prediction_index))
-            best = max(best, (count + 1, total_iou + iou))
-        return best
-
-    true_positives = solve(0, 0)[0]
+    matches, _ = maximum_iou_assignment(predictions, targets, threshold=threshold)
+    true_positives = len(matches)
     return true_positives, len(predictions) - true_positives, len(targets) - true_positives

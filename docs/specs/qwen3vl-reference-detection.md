@@ -30,7 +30,7 @@ CLI Application
   ├── Manifest/Data Module
   ├── Artifact Module
   ├── SFT Stage Module
-  ├── Evaluation Module            (next slice)
+  ├── Evaluation Module
   └── GRPO Stage Module            (next slice)
 ```
 
@@ -88,9 +88,10 @@ Implemented v1 kinds:
 - `artifact.init`
 - `data.voc`
 - `train.sft`
+- `evaluate`
 
-Reserved kinds `train.grpo` and `evaluate` fail with a targeted
-“not implemented by this release” error until their slices land.
+Reserved kind `train.grpo` fails with a targeted
+“not implemented by this release” error until its slice lands.
 
 The Data Module treats VOC XML as the authoritative record set, validates image
 size and bbox semantics, retains all instances of the selected Visual Concept,
@@ -104,6 +105,13 @@ assistant-only labels, no packing or truncation, deterministic positive/negative
 ordering, atomic checkpoints, and explicit `none`, `auto`, or exact-path resume.
 Publication records dataset/config fingerprints and lifecycle provenance in the
 Adapter Artifact.
+
+The Evaluation Module consumes a validated Dataset Artifact, immutable Adapter
+Artifact, and complete prediction JSONL containing `id` and the saved
+`raw_completion`. It never loads the model. It exact-matches Detection Sets,
+atomically publishes a fingerprinted `report.json` plus sorted per-record JSONL,
+and fails on missing, duplicate, or extra prediction identities. Prediction row
+order and the operational worker count cannot change report bytes.
 
 Example detection config:
 

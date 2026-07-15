@@ -28,3 +28,7 @@ class DatasetError(ConceptDetError):
 
 class TrainingError(ConceptDetError):
     """Raised when an SFT stage violates its data, lifecycle, or resource contract."""
+
+
+class EvaluationError(ConceptDetError):
+    """Raised when evaluation inputs or frozen report publication are invalid."""

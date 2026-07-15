@@ -152,6 +152,34 @@ Image paths in a manifest are relative to that manifest. Run:
 The output directory receives one PNG and JSON per record plus `results.jsonl`.
 Existing images are skipped unless `overwrite: true`.
 
+## Confidence-free evaluation
+
+[examples/evaluate.yaml](examples/evaluate.yaml) evaluates saved raw model
+completions against one split of an immutable Dataset Artifact and records the
+exact Adapter Artifact lineage. Prediction JSONL contains exactly one row per
+dataset record; line order has no meaning:
+
+```json
+{"id":"dataset-record-id","raw_completion":"[{\"bbox_2d\":[125,240,510,780]}]"}
+```
+
+Malformed completions remain legal evaluation inputs and reduce the
+`strict_valid_rate`; missing, duplicate, or extra record IDs fail closed. Run:
+
+```bash
+.venv/bin/python -m conceptdet config validate --config /tmp/evaluate.yaml
+.venv/bin/python -m conceptdet evaluate --config /tmp/evaluate.yaml --workers 4
+```
+
+The atomically published directory contains `report.json` and sorted
+`records.jsonl`, protected by an evaluation fingerprint. The primary metric is
+positive macro mean Set-F1 across IoU 0.50:0.05:0.95. The report also includes
+all-example Set-F1, micro Precision/Recall/F1@0.5, positive soft Set-F1,
+strict-valid rate, correct-empty rate, negative false-positive boxes per image,
+and count, relative-area, Visual Concept, and Reference Image swap slices.
+Matching is exact, one-to-one, and order-independent. ConceptDet does not report
+equal-score pseudo-mAP because the v1 Detection Set has no confidence scores.
+
 ## Development
 
 ```bash

@@ -20,6 +20,7 @@ from conceptdet.config import (
     BatchConfig,
     DataVocConfig,
     DetectConfig,
+    EvaluationConfig,
     OutputConfig,
     RequestConfig,
     SFTStageConfig,
@@ -32,6 +33,7 @@ from conceptdet.errors import (
     ConceptDetError,
     ConfigurationError,
     DatasetError,
+    EvaluationError,
     InputError,
 )
 from conceptdet.model import Qwen3VLAdapter
@@ -47,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="conceptdet", description="Qwen3-VL reference-guided Detection Sets"
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.4.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.5.0")
     domains = parser.add_subparsers(dest="domain", required=True)
 
     infer = domains.add_parser("infer", help="Run reference-guided inference")
@@ -82,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="none, auto, or an explicit checkpoint directory",
     )
+    evaluate = domains.add_parser(
+        "evaluate", help="Evaluate saved strict Detection Set predictions"
+    )
+    _config_argument(evaluate)
+    evaluate.add_argument("--workers", type=int, default=1)
     return parser
 
 
@@ -90,7 +97,14 @@ def _load_adapter(config: DetectConfig | BatchConfig) -> Qwen3VLAdapter:
 
 
 def _validate_resources(
-    config: DetectConfig | BatchConfig | ArtifactInitConfig | DataVocConfig | SFTStageConfig,
+    config: (
+        DetectConfig
+        | BatchConfig
+        | ArtifactInitConfig
+        | DataVocConfig
+        | SFTStageConfig
+        | EvaluationConfig
+    ),
 ) -> None:
     if isinstance(config, DetectConfig):
         AdapterArtifact.load(config.artifact)
@@ -128,13 +142,28 @@ def _validate_resources(
             raise DatasetError(
                 f"Compiled dataset output already exists: {config.output_dir}"
             )
-    else:
+    elif isinstance(config, SFTStageConfig):
         from conceptdet.training import validate_sft_dataset
 
         dataset = DatasetArtifact.load(config.dataset_dir)
         validate_sft_dataset(dataset)
         if config.artifact_dir.exists():
             raise ArtifactError(f"SFT Artifact output already exists: {config.artifact_dir}")
+    else:
+        from conceptdet.evaluation import EvaluationArtifact
+
+        DatasetArtifact.load(config.dataset_dir)
+        AdapterArtifact.load(config.artifact)
+        if not config.predictions.is_file():
+            raise EvaluationError(
+                f"Prediction JSONL does not exist: {config.predictions}"
+            )
+        if config.output_dir.exists():
+            # A valid frozen report is still immutable and cannot be overwritten.
+            EvaluationArtifact.load(config.output_dir)
+            raise EvaluationError(
+                f"Evaluation output already exists: {config.output_dir}"
+            )
 
 
 def _safe_name(value: str) -> str:
@@ -335,6 +364,24 @@ def _execute(args: argparse.Namespace) -> int:
         )
         return 0
 
+    if args.domain == "evaluate":
+        if not isinstance(config, EvaluationConfig):
+            raise ConfigurationError("evaluate requires kind: evaluate")
+        from conceptdet.evaluation import evaluate
+
+        result = evaluate(config, workers=args.workers)
+        print(
+            json.dumps(
+                {
+                    "evaluation": str(result.path),
+                    "evaluation_fingerprint": result.fingerprint,
+                    "metrics": result.report["metrics"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
     if args.operation == "detect":
         if not isinstance(config, DetectConfig):
             raise ConfigurationError("infer detect requires kind: infer.detect")
@@ -354,7 +401,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return _execute(args)
-    except (ConfigurationError, ArtifactError, DatasetError, InputError) as exc:
+    except (
+        ConfigurationError,
+        ArtifactError,
+        DatasetError,
+        EvaluationError,
+        InputError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except (ConceptDetError, OSError, ValueError) as exc:

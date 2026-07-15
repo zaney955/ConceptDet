@@ -1,0 +1,7 @@
+schema_version: 1
+kind: evaluate
+dataset_dir: ../outputs/datasets/generalcomp-v1
+artifact: ../outputs/sft/generalcomp-sft-artifact
+predictions: ../outputs/predictions/generalcomp-test.jsonl
+split: test
+output_dir: ../outputs/evaluations/generalcomp-test

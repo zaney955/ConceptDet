@@ -5,4 +5,4 @@ from conceptdet.config import RequestConfig
 from conceptdet.types import Box
 
 __all__ = ["Box", "DetectionApplication", "DetectionResult", "RequestConfig"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -15,6 +15,7 @@ from conceptdet.artifact import (
 from conceptdet.config import (
     ArtifactInitConfig,
     DataVocConfig,
+    EvaluationConfig,
     OptimizationConfig,
     RuntimeConfig,
     SFTStageConfig,
@@ -250,3 +251,47 @@ def test_train_sft_cli_forwards_explicit_resume(tmp_path: Path, monkeypatch, cap
     )
     assert received == [checkpoint]
     assert json.loads(capsys.readouterr().out)["artifact_fingerprint"] == "artifact-hash"
+
+
+def test_evaluate_cli_forwards_worker_count(tmp_path: Path, monkeypatch, capsys) -> None:
+    import conceptdet.evaluation as evaluation
+
+    config = EvaluationConfig(
+        1,
+        "evaluate",
+        tmp_path / "dataset",
+        tmp_path / "adapter",
+        tmp_path / "predictions.jsonl",
+        "test",
+        tmp_path / "evaluation",
+        tmp_path / "evaluate.yaml",
+        "config-hash",
+    )
+    received: list[int] = []
+
+    def fake_evaluate(_: object, *, workers: int) -> SimpleNamespace:
+        received.append(workers)
+        return SimpleNamespace(
+            path=config.output_dir,
+            fingerprint="evaluation-hash",
+            report={"metrics": {"positive_macro_mean_set_f1_50_95": 0.5}},
+        )
+
+    monkeypatch.setattr(cli, "load_config", lambda _: config)
+    monkeypatch.setattr(evaluation, "evaluate", fake_evaluate)
+    assert (
+        cli.main(
+            [
+                "evaluate",
+                "--config",
+                str(config.config_path),
+                "--workers",
+                "4",
+            ]
+        )
+        == 0
+    )
+    assert received == [4]
+    assert json.loads(capsys.readouterr().out)["evaluation_fingerprint"] == (
+        "evaluation-hash"
+    )

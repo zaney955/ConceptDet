@@ -1,4 +1,4 @@
-.PHONY: env install run data train-sft verify-env test lint check
+.PHONY: env install run data train-sft evaluate verify-env test lint check
 
 env:
 	bash scripts/create_env.sh
@@ -16,6 +16,10 @@ data:
 train-sft:
 	@test -n "$(CONFIG)" || (echo "Usage: make train-sft CONFIG=/path/to/train-sft.yaml" >&2; exit 2)
 	PYTHONPATH=src .venv/bin/python -m conceptdet train sft --config "$(CONFIG)" --resume "$(or $(RESUME),none)"
+
+evaluate:
+	@test -n "$(CONFIG)" || (echo "Usage: make evaluate CONFIG=/path/to/evaluate.yaml" >&2; exit 2)
+	PYTHONPATH=src .venv/bin/python -m conceptdet evaluate --config "$(CONFIG)" --workers "$(or $(WORKERS),1)"
 
 verify-env:
 	.venv/bin/python scripts/check_environment.py --require-cuda

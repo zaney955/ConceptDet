@@ -6,6 +6,7 @@ from conceptdet.config import (
     ArtifactInitConfig,
     DataVocConfig,
     DetectConfig,
+    EvaluationConfig,
     SFTStageConfig,
     config_to_dict,
     load_config,
@@ -136,3 +137,35 @@ optimization: {epochs: 1, max_steps: 2, gradient_accumulation_steps: 2}
     assert isinstance(sft, SFTStageConfig)
     assert sft.optimization.max_steps == 2
     assert sft.runtime.local_files_only is True
+
+
+def test_evaluation_config_has_frozen_metrics_and_resolved_inputs(tmp_path: Path) -> None:
+    config = load_config(
+        _write(
+            tmp_path / "evaluate.yaml",
+            """
+schema_version: 1
+kind: evaluate
+dataset_dir: compiled
+artifact: adapter
+predictions: predictions.jsonl
+split: validation
+output_dir: evaluation
+""",
+        )
+    )
+    assert isinstance(config, EvaluationConfig)
+    assert config.dataset_dir == (tmp_path / "compiled").resolve()
+    assert config.artifact == (tmp_path / "adapter").resolve()
+    assert config.predictions == (tmp_path / "predictions.jsonl").resolve()
+    assert config.split == "validation"
+    assert set(config_to_dict(config)) == {
+        "schema_version",
+        "kind",
+        "dataset_dir",
+        "artifact",
+        "predictions",
+        "split",
+        "output_dir",
+        "config_hash",
+    }

@@ -61,3 +61,9 @@ def test_exact_matching_penalizes_duplicates_and_is_order_independent() -> None:
     predictions = [targets[1], targets[0], targets[0]]
     assert hard_set_counts(predictions, targets, 0.5) == (2, 1, 0)
     assert hard_set_counts(list(reversed(predictions)), targets, 0.5) == (2, 1, 0)
+
+
+def test_exact_matching_has_no_small_detection_set_limit() -> None:
+    targets = [Box(index * 30, 0, index * 30 + 20, 20) for index in range(25)]
+    predictions = list(reversed(targets))
+    assert hard_set_counts(predictions, targets, 0.5) == (25, 0, 0)
